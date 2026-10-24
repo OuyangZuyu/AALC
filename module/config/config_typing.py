@@ -1,0 +1,675 @@
+from typing import List, Optional
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from utils.route_weights import DEFAULT_ROUTE_WEIGHTS, validated_route_weights
+
+
+class EgoReleaseRule(BaseModel):
+    """按列表优先级，在指定 TURN 尝试的 EGO 配置。"""
+
+    enabled: bool = True
+    turn: int = Field(default=1, ge=1, le=99)
+    name: str = ""
+    mode: int = Field(default=1, ge=0, le=1)
+
+
+class TeamSetting(BaseModel):
+    """单个队伍设置"""
+
+    rabbit_lower_chain: bool = False
+    """旧配置兼容字段，不再单独启用下排连线"""
+
+    rabbit_ego_enabled: bool = False
+    rabbit_ego_rules: List[EgoReleaseRule] = Field(default_factory=list)
+    """同 TURN 按列表顺序选首个可用 EGO，后续条目作为备用"""
+
+    # Keep the single-rule values readable for older configuration files.
+    rabbit_ego_turn: int = Field(default=1, ge=1, le=99)
+    rabbit_ego_name: str = ""
+    rabbit_ego_mode: int = Field(default=1, ge=0, le=1)
+    """指定 TURN 尝试一次 EGO，0 觉醒、1 侵蚀；名称为游戏完整文本"""
+
+    gift_lock_enabled: bool = False
+    gift_lock_images: List[str] = Field(default_factory=list)
+    mirror_floor_limit: int = Field(default=5, ge=1, le=5)
+    stop_fusion_on_failure: bool = False
+    battle_retry_limit_enabled: bool = False
+    battle_max_attempts: int = Field(default=4, ge=1, le=20)
+
+    route_weights_enabled: bool = False
+    route_node_weights: dict[str, int] = Field(default_factory=lambda: dict(DEFAULT_ROUTE_WEIGHTS))
+
+    @field_validator("route_node_weights", mode="before")
+    @classmethod
+    def _validate_route_weights(cls, values):
+        return validated_route_weights(values)
+
+    rabbit_event_exclusion_enabled: bool = False
+    rabbit_event_excluded: List[int] = Field(default_factory=list, max_length=11)
+    """不参与事件的罪人，使用 0..11 的原版罪人顺序"""
+
+    rabbit_observe_enabled: bool = False
+    rabbit_observe_rules: List[List[int]] = Field(default_factory=list)
+    """实验性卡包观测规则，每项为 [楼层, 行, 列]"""
+
+    rabbit_animation_hold: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_floor_limit(cls, values):
+        if isinstance(values, dict):
+            values = dict(values)
+            if "mirror_floor_limit" not in values and "floor_3_exit" in values:
+                values["mirror_floor_limit"] = 3 if values["floor_3_exit"] else 5
+            values.pop("floor_3_exit", None)
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_gift_lock(cls, values):
+        if isinstance(values, dict):
+            values = dict(values)
+            if "gift_lock_enabled" not in values:
+                values["gift_lock_enabled"] = bool(values.get("protect_gift_images", False)
+                                                   or values.get("specify_gift_images", False))
+            if "gift_lock_images" not in values:
+                values["gift_lock_images"] = list(dict.fromkeys(
+                    list(values.get("protected_gift_images") or [])
+                    + list(values.get("specified_gift_images") or [])
+                ))
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_single_ego_rule(cls, values):
+        if isinstance(values, dict) and "rabbit_ego_rules" not in values:
+            name = values.get("rabbit_ego_name", "")
+            if isinstance(name, str) and name.strip():
+                values = dict(values)
+                values["rabbit_ego_rules"] = [{
+                    "enabled": True,
+                    "turn": values.get("rabbit_ego_turn", 1),
+                    "name": name,
+                    "mode": values.get("rabbit_ego_mode", 1),
+                }]
+        return values
+
+    @field_validator("rabbit_event_excluded")
+    @classmethod
+    def _validate_event_excluded(cls, values: List[int]) -> List[int]:
+        if any(value < 0 or value > 11 for value in values):
+            raise ValueError("事件排除罪人编号必须在 0 到 11 之间")
+        if len(values) != len(set(values)):
+            raise ValueError("事件排除罪人不能重复")
+        return values
+
+    @field_validator("rabbit_observe_rules")
+    @classmethod
+    def _validate_observe_rules(cls, rules: List[List[int]]) -> List[List[int]]:
+        floors = set()
+        for rule in rules:
+            if len(rule) != 3:
+                raise ValueError("卡包观测规则必须包含楼层、行、列")
+            floor, row, column = rule
+            if not (1 <= floor <= 5 and 1 <= row <= 10 and 1 <= column <= 5):
+                raise ValueError("卡包观测规则超出楼层或行列范围")
+            if floor in floors:
+                raise ValueError("每个楼层只能设置一个观测目标")
+            floors.add(floor)
+        return rules
+
+    team_system: int = 0
+    """队伍使用的体系"""
+
+    team_number: int = 1
+    """使用的队伍序号"""
+
+    shop_strategy: int = 0
+    """商店策略"""
+
+    sinners_be_select: int = 0
+    """有几名罪人被选中"""
+
+    chosen_sinners: List[int] = [0] * 12
+    """有哪几名罪人被选中"""
+
+    sinner_order: List[int] = [0] * 12
+    """罪人被选中的顺序"""
+
+    system_burn: bool = False
+    """弃置燃烧饰品"""
+
+    system_bleed: bool = False
+    """弃置流血饰品"""
+
+    system_tremor: bool = False
+    """弃置震颤饰品"""
+
+    system_rupture: bool = False
+    """弃置破裂饰品"""
+
+    system_poise: bool = False
+    """弃置呼吸饰品"""
+
+    system_sinking: bool = False
+    """弃置沉沦饰品"""
+
+    system_charge: bool = False
+    """弃置充能饰品"""
+
+    system_slash: bool = False
+    """弃置斩击饰品"""
+
+    system_pierce: bool = False
+    """弃置穿刺饰品"""
+
+    system_blunt: bool = False
+    """弃置打击饰品"""
+
+    do_not_heal: bool = False
+    """不治疗"""
+
+    do_not_buy: bool = False
+    """不购买"""
+
+    do_not_fuse: bool = False
+    """不合成"""
+
+    do_not_sell: bool = False
+    """不出售"""
+
+    do_not_enhance: bool = False
+    """不升级"""
+
+    only_aggressive_fuse: bool = False
+    """合成只采取激进策略"""
+
+    do_not_system_fuse: bool = False
+    """不合成体系饰品"""
+
+    only_system_fuse: bool = False
+    """只合成体系饰品"""
+
+    avoid_skill_3: bool = False
+    """避免使用3技能"""
+
+    prioritize_skill_3: bool = False
+    """优先使用3技能"""
+
+    re_formation_each_floor: bool = False
+    """每个楼层重新编队"""
+
+    normal_to_hard_floor: int = 0
+    """进入困难模式的楼层"""
+
+    use_starlight: bool = False
+    """开局星光换钱"""
+
+    aggressive_also_enhance: bool = False
+    """激进合成期间也升级饰品"""
+
+    aggressive_save_systems: bool = False
+    """激进合成保留体系饰品"""
+
+    defense_first_round: bool = False
+    """第一回合全员防御"""
+
+    defense_for_solo: bool = False
+    """小指良单通杀家人"""
+
+    defense_for_solo_turns: int = 5
+    """小指良连续全员防御回合数"""
+
+    fixed_team_use: bool = False
+    """固定队伍用途"""
+
+    fixed_team_use_select: int = 0
+    """固定队伍用途的选择项"""
+
+    reward_cards: bool = False
+    """奖励卡优先度"""
+
+    reward_cards_select: int = 0
+    """自定义奖励卡优先度"""
+
+    opening_bonus: List[int] = [1, 1, 1, 1, 0, 0, 0, 0, 0, 0]
+    """开局星光加成：0 未选中，1 基础，2 +，3 ++"""
+
+    after_level_IV: bool = False
+    """自定义合成四级后的操作"""
+
+    after_level_IV_select: int = 0
+    """合成四级后的操作"""
+
+    shopping_strategy: bool = False
+    """自定义购物策略"""
+
+    shopping_strategy_select: int = 0
+    """购物策略"""
+
+    opening_items: bool = False
+    """自定义开局道具"""
+
+    opening_items_select: int = 0
+    """开局道具选择顺序"""
+
+    opening_items_system: int = 0
+    """开局道具体系"""
+
+    second_system: bool = False
+    """启用第二体系"""
+
+    second_system_select: int = 0
+    """第二体系"""
+
+    second_system_setting: int = 0
+    """第二体系启用时间"""
+
+    second_system_action: List[int] = [0] * 4
+    """第二体系行动模式"""
+
+    observe_ego_gift: bool = False
+    """是否启用观测EGO饰品"""
+
+    observe_ego_gift_selected: List[str] = []
+    """用户选择的观测EGO饰品列表"""
+
+    skill_replacement: bool = False
+    """自定义技能替换"""
+
+    skill_replacement_select: int = 0
+    """技能替换设置"""
+
+    skill_replacement_mode: int = 0
+    """技能替换模式：0=1→3，1=2→3，2=1→2，3=全换3（先2→3，再1→3），4=全换3（先1→3，再2→3）"""
+
+    ignore_shop: List[int] = [0] * 5
+    """忽略商店楼层"""
+
+    max_keyword_refresh: int = 1
+    """每次商店定向刷新最大次数"""
+
+    max_normal_refresh: int = 1
+    """每次商店普通刷新最大次数"""
+
+    remark_name: Optional[str] = None
+    """队伍备注名"""
+
+    use_custom_theme_pack_weight: bool = False
+    """启用队伍自定义主题包权重"""
+
+    use_team_code: bool = False
+    """是否使用编队码自动组队"""
+
+    team_code: str = ""
+    """编队码字符串"""
+
+    total_mirror_time_hard: List[float] = [0.0, 0.0, 0.0]
+    """困难镜牢总用时"""
+
+    mirror_hard_count: int = 0
+    """困难镜牢次数"""
+
+    total_mirror_time_normal: List[float] = [0.0, 0.0, 0.0]
+    """普通镜牢总用时"""
+
+    mirror_normal_count: int = 0
+    """普通镜牢次数"""
+
+
+class ConfigModel(BaseModel):
+    """配置模型"""
+
+    config_version: int
+    """配置文件版本号（时间戳）"""
+
+    game_title_name: str
+    """游戏窗口标题"""
+
+    game_process_name: str
+    """游戏进程名"""
+
+    game_path: str
+    """游戏启动路径"""
+
+    after_completion_actions: List[str]
+    """脚本结束后的前置动作（可多选）：exit_game/exit_emulator/exit_aalc"""
+
+    after_completion_power_action: str
+    """脚本结束后的最终动作（单选）：none/sleep/hibernate/lock/shutdown"""
+
+    keep_after_completion: bool
+    """是否保持脚本结束后的操作"""
+
+    language_in_program: str
+    """程序语言"""
+
+    shutdown_hotkey: str
+    """关闭快捷键"""
+
+    pause_hotkey: str
+    """暂停快捷键"""
+
+    resume_hotkey: str
+    """继续快捷键"""
+
+    announcement: float
+    """公告板时间戳"""
+
+    memory_protection: bool
+    """内存占用保护"""
+
+    background_click: bool
+    """是否使用后台点击"""
+
+    win_input_type: str
+    """键鼠操控方式"""
+
+    auto_hard_mirror: bool
+    """周四自动切换困难镜牢"""
+
+    last_auto_change: float
+    """上次自动切换困难镜牢的时间戳"""
+
+    hard_mirror_chance: int
+    """困难镜牢剩余次数"""
+
+    zoom_scale: int
+    """缩放比例"""
+
+    window_position_x: int
+    """窗口位置x"""
+
+    window_position_y: int
+    """窗口位置y"""
+
+    theme_mode: str
+    """应用主题：AUTO, LIGHT, DARK"""
+
+    autostart: bool
+    """自启动"""
+
+    autodaily: bool
+    """启用定时执行"""
+
+    autodaily_task: List[bool]
+    """定时任务列表"""
+
+    autodaily_task_exit: List[bool]
+    """定时任务退出列表: [exit_game, exit_aalc, sleep, hibernate, shutdown, lock, exit_emulator]"""
+
+    autodaily_time: str
+    """定时执行时间（HH:mm）"""
+
+    autodaily2: bool
+    """启用定时执行2"""
+
+    autodaily2_task: List[bool]
+    """定时任务2列表"""
+
+    autodaily2_task_exit: List[bool]
+    """定时任务2退出列表: [exit_game, exit_aalc, sleep, hibernate, shutdown, lock, exit_emulator]"""
+
+    autodaily_time2: str
+    """定时执行时间2（HH:mm）"""
+
+    autodaily3: bool
+    """启用定时执行3"""
+
+    autodaily3_task: List[bool]
+    """定时任务3列表"""
+
+    autodaily3_task_exit: List[bool]
+    """定时任务3退出列表: [exit_game, exit_aalc, sleep, hibernate, shutdown, lock, exit_emulator]"""
+
+    autodaily_time3: str
+    """定时执行时间3（HH:mm）"""
+
+    autodaily4: bool
+    """启用定时执行4"""
+
+    autodaily4_task: List[bool]
+    """定时任务4列表"""
+
+    autodaily4_task_exit: List[bool]
+    """定时任务4退出列表: [exit_game, exit_aalc, sleep, hibernate, shutdown, lock, exit_emulator]"""
+
+    autodaily_time4: str
+    """定时执行时间4（HH:mm）"""
+
+    minimize_to_tray: bool
+    """最小化到托盘"""
+
+    screenshot_interval: float
+    """截图间隔时间"""
+
+    mouse_action_interval: float
+    """鼠标操作间隔时间"""
+
+    mouse_down_duration: float
+    """鼠标按下持续时间"""
+
+    use_post_message: bool
+    """是否使用PostMessage进行输入"""
+
+    resonate_with_Ahab: bool
+    """是否播放亚哈语录"""
+
+    experimental_keep_screen_awake: bool
+    """运行期间阻止系统与显示器休眠，任务结束自动恢复"""
+
+    experimental_hdr_warning: bool
+    """任务启动时检测游戏显示器 HDR 状态并提示潜在识别问题"""
+
+    simulator: bool
+    """是否使用模拟器"""
+
+    simulator_type: int
+    """0:mumu, 1:BlueStacks 5, 10:其他"""
+
+    simulator_host: str
+    """BlueStacks 或其他模拟器的 ADB 主机名或 IP 地址"""
+
+    simulator_port: int
+    """BlueStacks 或其他模拟器的 ADB 端口"""
+
+    mumu_instance_number: int
+    """mumu模拟器的实例编号"""
+
+    bluestacks_instance_name: str
+    """BlueStacks 5 的内部实例名；留空时按端口或唯一实例自动选择"""
+
+    start_emulator_timeout: int
+    """启动模拟器超时时间"""
+
+    task_stall_timeout: int
+    """页面无进展后的默认重启等待时间（秒）；不覆盖流程显式指定的超时"""
+
+    adb_reconnect_on_error: bool
+    """ADB或minitouch连接失效时自动重连"""
+
+    check_update: bool
+    """检查更新"""
+
+    update_prerelease_enable: bool
+    """启用预发布版更新"""
+
+    update_source: str
+    """更新源"""
+
+    mirrorchyan_cdk: str
+    """Mirror酱 CDK"""
+
+    image_resource_sync: bool
+    """是否启用图片资源自动同步"""
+
+    image_resource_source: str
+    """图片资源同步源"""
+
+    default_page: int
+    """保存启动后的页面"""
+
+    set_windows: bool
+    """是否进行自动窗口设置"""
+
+    set_win_size: int
+    """设置使用的分辨率"""
+
+    set_win_position: str
+    """是否自动设置窗口的位置"""
+
+    set_reduce_miscontact: bool
+    """是否防止误触"""
+
+    select_team_by_order: bool
+    """是否按顺序（而非名称）选择队伍"""
+
+    daily_task: bool
+    """是否进行日常本"""
+
+    set_EXP_count: int
+    """设置经验本的次数"""
+
+    set_thread_count: int
+    """设置纽本的次数"""
+
+    daily_teams: int
+    """设置日常本使用的队伍"""
+
+    targeted_teaming_EXP: bool
+    """经验本指定队伍"""
+
+    EXP_day_1_2: int
+    """周一/二经验本队伍"""
+
+    EXP_day_3_4: int
+    """周三/四经验本队伍"""
+
+    EXP_day_5_6: int
+    """周五/六经验本队伍"""
+
+    EXP_day_7: int
+    """周日经验本队伍"""
+
+    targeted_teaming_thread: bool
+    """纽本指定队伍"""
+
+    use_continuous_combat: bool
+    """是否使用连续作战"""
+
+    use_continuous_combat_select: int
+    """一场连续作战的最大次数"""
+
+    thread_day_1: int
+    """周一纽本队伍"""
+
+    thread_day_2: int
+    """周二纽本队伍"""
+
+    thread_day_3: int
+    """周三纽本队伍"""
+
+    thread_day_4: int
+    """周四纽本队伍"""
+
+    thread_day_5: int
+    """周五纽本队伍"""
+
+    thread_day_6: int
+    """周六纽本队伍"""
+
+    thread_day_7: int
+    """周日纽本队伍"""
+
+    get_reward: bool
+    """是否进行获取奖励"""
+
+    set_get_prize: int
+    """奖励领取模式"""
+
+    buy_enkephalin: bool
+    """是否自动购买体力"""
+
+    set_lunacy_to_enkephalin: int
+    """购买体力次数"""
+
+    Dr_Grandet_mode: bool
+    """葛朗台模式"""
+
+    skip_enkephalin: bool
+    """跳过换体"""
+
+    mirror: bool
+    """是否进行自动镜牢"""
+
+    set_mirror_count: int
+    """镜牢的次数"""
+
+    hard_mirror: int | bool
+    """进行困难镜牢"""
+
+    no_weekly_bonuses: int | bool
+    """不使用每周加成"""
+
+    infinite_dungeons: bool
+    """无限刷牢"""
+
+    save_rewards: bool
+    """保存奖励不领"""
+
+    hard_mirror_single_bonuses: bool
+    """困难镜牢使用单次加成"""
+
+    select_event_pack: bool
+    """第五层选择活动卡包"""
+
+    skip_event_pack: bool
+    """第五层跳过活动卡包"""
+
+    re_claim_rewards: bool
+    """再次执行领取奖励任务"""
+
+    not_skip_whitegossypium: bool
+    """不跳过白棉花"""
+
+    fight_to_last_man: bool
+    """战斗直到全灭"""
+
+    teams_be_select_num: int
+    """被选中的队伍数量"""
+
+    teams_be_select: List[bool]
+    """被选中的队伍"""
+
+    teams_order: List[int]
+    """队伍的顺序"""
+
+    teams_active_queue: List[int]
+    """镜牢启用队伍的执行队列（单一事实源）"""
+
+    mirror_keyboard_navigation: bool
+    """使用键盘进行镜牢寻路"""
+
+    mirror_lower_chain: bool
+    """所有镜牢编队在普通遭遇连接下排行动槽，日常战斗不受影响"""
+
+
+    battle_speed_hold: bool
+    """暂停按钮或动画信号任一触发长按加速，单次最多30秒"""
+
+    disable_mirror_rewards: bool
+    """所有镜牢结算放弃奖励，只记录运行数据"""
+
+    mirror_keyboard_simple_pathfinding: bool
+    """简单键盘寻路模式：始终按↑选择第一个节点，完全避免鼠标拖动"""
+
+    teams: dict[str, TeamSetting]
+    """队伍设置"""
+
+    @field_validator("use_continuous_combat_select")
+    @classmethod
+    def _coerce_continuous_combat_select(cls, v: int) -> int:
+        if v < 1:
+            return 1
+        return v

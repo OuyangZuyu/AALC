@@ -1,0 +1,538 @@
+import platform
+import random
+from datetime import datetime
+from threading import Event
+from time import sleep, time
+
+import win32api
+import win32con
+from playsound3 import playsound
+from PySide6.QtCore import QT_TRANSLATE_NOOP, QMutex, QThread
+
+from app import mediator
+from app.windows_toast import TemplateToast, send_toast
+from module.automation import auto
+from module.config import TeamSetting, cfg
+from module.decorator.decorator import begin_and_finish_time_log
+from module.game_and_screen import game_process, screen
+from module.game_and_screen.hdr import get_monitor_hdr_info
+from module.logger import log
+from module.my_error.my_error import (
+    backMainWinError,
+    cannotOperateGameError,
+    netWorkUnstableError,
+    notWaitError,
+    unableToFindTeamError,
+    unexpectNumError,
+    userStopError,
+    withOutAdminError,
+    withOutGameWinError,
+    withOutPicError,
+)
+from module.system_actions import (
+    apply_power_keep_awake,
+    execute_after_completion,
+    get_after_completion_config,
+)
+from tasks.base.back_init_menu import back_init_menu
+from tasks.base.make_enkephalin_module import (
+    lunacy_to_enkephalin,
+    make_enkephalin_module,
+)
+from tasks.base.retry_monitor import retry_monitor
+from tasks.battle import battle
+from tasks.daily.get_prize import get_mail_prize, get_pass_prize
+from tasks.daily.luxcavation import EXP_luxcavation, thread_luxcavation
+from tasks.mirror.mirror import Mirror
+from tasks.mirror.observation_failure import MirrorRunOutcome, ObservationCleanupError
+from tasks.mirror.failure_policy import MirrorBattleAttemptsExhausted, forfeit_failed_run
+from tasks.teams.team_formation import select_battle_team
+from utils.path_manager import path_manager
+from utils.utils import calculate_the_teams, check_hard_mirror_time, get_day_of_week
+
+
+@begin_and_finish_time_log(task_name="一次经验本")
+# 一次经验本的过程
+def onetime_EXP_process(combat_count: int = 1):
+    if cfg.targeted_teaming_EXP:
+        team = cfg.get_value(f"EXP_day_{calculate_the_teams()}")
+    else:
+        team = cfg.daily_teams
+    EXP_luxcavation(combat_count)
+    select_battle_team(team)
+    if battle.to_battle() is False:
+        return False
+    battle.fight(combat_count=combat_count)
+    back_init_menu()
+    make_enkephalin_module()
+
+
+@begin_and_finish_time_log(task_name="一次纽本")
+# 一次纽本的过程
+def onetime_thread_process(combat_count: int = 1):
+    if cfg.targeted_teaming_thread:
+        team = cfg.get_value(f"thread_day_{get_day_of_week()}")
+    else:
+        team = cfg.daily_teams
+    thread_luxcavation(combat_count)
+    select_battle_team(team)
+    if battle.to_battle() is False:
+        return False
+    battle.fight(combat_count=combat_count)
+    back_init_menu()
+    make_enkephalin_module()
+
+
+@begin_and_finish_time_log(task_name="一次镜牢")
+# 一次镜牢的过程
+def onetime_mir_process(team_setting: TeamSetting, team_num: int):
+    # 实时检查是否需要切换到困难镜牢
+    if cfg.auto_hard_mirror and check_hard_mirror_time():
+        log.info("检测到新的困牢周期，实时切换困难镜牢，设置困牢次数为3")
+        cfg.set_value("last_auto_change", datetime.now().timestamp())
+        cfg.set_value("hard_mirror", True)
+        cfg.set_value("hard_mirror_chance", 3)
+
+    # 进行一次镜牢
+    try:
+        mirror_adventure = Mirror(team_setting, team_num)
+        outcome = mirror_adventure.run()
+        if outcome in (MirrorRunOutcome.ABANDONED, MirrorRunOutcome.DEVELOPER_NO_REWARDS):
+            return outcome
+        if outcome:
+            del mirror_adventure
+            mirror_adventure = None
+            back_init_menu()
+            make_enkephalin_module()
+            return True
+        else:
+            return False
+    except MirrorBattleAttemptsExhausted as error:
+        log.warning(str(error))
+        mirror_adventure.observation_forfeit = True
+        forfeit_failed_run(auto, log, running=lambda: battle.running, config=cfg)
+        battle.fail_times = 0
+        if getattr(cfg, "disable_mirror_rewards", False):
+            return mirror_adventure.record_developer_result("attempts_exhausted")
+        mirror_adventure._record_long_term_log(False, str(error))
+        return MirrorRunOutcome.ABANDONED
+    except ObservationCleanupError:
+        raise
+    except Exception as e:
+        log.exception(f"镜牢行动出错: {e}")
+        if "mirror_adventure" in locals() and mirror_adventure.observation_forfeit:
+            raise
+        return False
+
+
+def to_get_reward():
+    if cfg.set_get_prize == 0:
+        back_init_menu()
+        get_pass_prize()
+        back_init_menu()
+        get_mail_prize()
+        back_init_menu()
+    elif cfg.set_get_prize == 1:
+        back_init_menu()
+        get_pass_prize()
+        back_init_menu()
+    else:
+        back_init_menu()
+        get_mail_prize()
+        back_init_menu()
+
+
+def init_game():
+    log.debug("初始化游戏")
+    if cfg.simulator:
+        if cfg.simulator_type == 0:
+            mumu_instance_number = 0
+            if cfg.simulator_port == 0 and cfg.mumu_instance_number == -1:
+                log.info("未设置模拟器端口或实例编号，使用默认mumu模拟器")
+            elif cfg.simulator_port != 0:
+                if cfg.simulator_port == 16384 or (cfg.simulator_port - 16384) % 32 == 0:
+                    mumu_instance_number = 0 if cfg.simulator_port == 16384 else (cfg.simulator_port - 16384) // 32
+                    log.debug(f"使用mumu模拟器实例号为 {mumu_instance_number}")
+                else:
+                    log.info("设置的模拟器端口非常用默认端口，使用默认mumu模拟器")
+            elif cfg.mumu_instance_number != -1:
+                mumu_instance_number = cfg.mumu_instance_number
+            log.debug(
+                f"init_game: 模拟器类型=Mumu, 实例编号={mumu_instance_number}, "
+                f"simulator_port={cfg.simulator_port}, mumu_instance_number={cfg.mumu_instance_number}"
+            )
+            from module.automation.input_handlers.simulator.mumu_control import (
+                MumuControl,
+            )
+
+            MumuControl(instance_number=mumu_instance_number)
+        else:
+            from module.automation.input_handlers.simulator.simulator_control import (
+                SimulatorControl,
+            )
+
+            # 启动时先清理旧连接
+            SimulatorControl.clean_connect()
+            SimulatorControl()
+    auto.init_input()
+    if cfg.simulator:
+        if cfg.simulator_type == 0:
+            from module.automation.input_handlers.simulator.mumu_control import (
+                MumuControl,
+            )
+
+            MumuControl.connection_device.start_game()
+        else:
+            from module.automation.input_handlers.simulator.simulator_control import (
+                SimulatorControl,
+            )
+
+            SimulatorControl.connection_device.start_game()
+    else:
+        game_process.start_game()
+        while not screen.init_handle():
+            sleep(10)
+        if cfg.set_windows:
+            screen.set_win()
+
+
+def _warn_if_game_monitor_hdr_enabled() -> None:
+    if cfg.simulator or not bool(cfg.get_value("experimental_hdr_warning", True)):
+        return
+
+    hwnd = screen.handle.hwnd
+    if not hwnd:
+        log.warning("游戏窗口句柄无效，跳过 HDR 检测")
+        return
+
+    try:
+        hmonitor = win32api.MonitorFromWindow(
+            hwnd,
+            win32con.MONITOR_DEFAULTTONEAREST,
+        )
+        info = get_monitor_hdr_info(int(hmonitor))
+    except Exception as exc:
+        log.warning(f"检测游戏显示器 HDR 状态失败: {exc}")
+        return
+
+    if info is None or not info.hdr_enabled:
+        return
+
+    acknowledged = Event()
+    log.warning("检测到游戏所在显示器已开启 HDR，可能导致图像识别问题")
+    mediator.hdr_warning.emit(acknowledged)
+    acknowledged.wait()
+
+
+def Resonate_with_Ahab():
+    random_number = random.randint(1, 4)
+    playsound(f"assets/audio/This_is_all_your_fault_{random_number}.mp3", block=False)
+
+
+def _get_game_rendering_scale() -> int | None:
+    """读取非模拟器模式下 Limbus 的渲染比例设置。"""
+    try:
+        import json
+        import winreg
+
+        root = winreg.HKEY_CURRENT_USER
+        sub_key = r"Software\ProjectMoon\LimbusCompany"
+        value_name = "LocalSave.LocalGameOptionData_h467498167"
+        with winreg.OpenKey(root, sub_key, 0, winreg.KEY_READ) as key:
+            raw_data, reg_type = winreg.QueryValueEx(key, value_name)
+
+        if reg_type != winreg.REG_BINARY:
+            log.debug(f"游戏设置注册表值类型为 {reg_type}，预期为 REG_BINARY")
+            return None
+
+        json_str = raw_data.rstrip(b"\x00").decode("utf-8")
+        game_config = json.loads(json_str)
+        return game_config.get("_renderingScale")
+    except FileNotFoundError:
+        log.debug(r"游戏设置注册表路径不存在: HKEY_CURRENT_USER\Software\ProjectMoon\LimbusCompany")
+    except PermissionError:
+        log.debug("读取游戏设置注册表时权限不足")
+    except Exception as e:
+        log.debug(f"读取游戏渲染比例失败: {e}")
+    return None
+
+
+def _batch_combat(process_fn, times, max_times):
+    """按 max_times 分批执行战斗"""
+    if times <= 0:
+        return
+    if times > max_times:
+        once = max_times
+        total = times // max_times
+        last = times % max_times
+    else:
+        once = times
+        total = 0
+        last = times
+    for _ in range(total):
+        process_fn(once)
+    if last > 0:
+        process_fn(last)
+
+
+def _single_combat_run(exp_times, thread_times):
+    for _ in range(exp_times):
+        onetime_EXP_process()
+    for _ in range(thread_times):
+        onetime_thread_process()
+
+
+def Daily_task_wrapper(get_reward=None):
+    def wrapper():
+        back_init_menu()
+        make_enkephalin_module()
+        exp_times = cfg.set_EXP_count
+        if get_reward and get_reward == "EXP":
+            exp_times -= 1
+        thread_times = cfg.set_thread_count
+        if get_reward and get_reward == "thread":
+            thread_times -= 1
+        if cfg.config.use_continuous_combat and cfg.use_continuous_combat_select > 0:
+            max_times = cfg.use_continuous_combat_select
+            _batch_combat(onetime_EXP_process, exp_times, max_times)
+            _batch_combat(onetime_thread_process, thread_times, max_times)
+        else:
+            _single_combat_run(exp_times, thread_times)
+
+    return wrapper
+
+
+def Buy_enkephalin():
+    times = cfg.set_lunacy_to_enkephalin
+    back_init_menu()
+    lunacy_to_enkephalin(times=times)
+
+
+def Mirror_task():
+    # 判断执行镜牢任务的次数
+    mir_times = cfg.set_mirror_count
+    if cfg.infinite_dungeons:
+        mir_times = 9999
+    if cfg.save_rewards and cfg.hard_mirror and not getattr(cfg, "disable_mirror_rewards", False):
+        mir_times = 1
+        log.info("启用了保存困牢奖励，将只执行一次困牢，并且不结算")
+    finish_times = 0
+    mediator.mirror_signal.emit(0, mir_times)
+    cfg.normalize_and_sync_team_state(persist=False)
+    # 开始执行镜牢任务
+    while mir_times > 0:
+        # 检测配置的队伍能否顺利执行
+        useful = False
+        hard = bool(cfg.hard_mirror)
+        teams_be_select = cfg.get_value("teams_be_select")
+        for index in (i for i, t in enumerate(teams_be_select) if t is True):
+            team_setting = cfg.config.teams[f"{index + 1}"]
+            if team_setting.fixed_team_use is False:
+                useful = True
+                break
+            if team_setting.fixed_team_use_select == 1 and hard is False:
+                useful = True
+                break
+            if team_setting.fixed_team_use_select == 0 and hard is True:
+                useful = True
+                break
+        if useful is False:
+            break
+
+        if not cfg.teams_active_queue:
+            break
+
+        team_num = cfg.teams_active_queue[0]
+        team_setting = cfg.config.teams[f"{team_num}"]
+        # 如果该队伍固定了用途，且用途不符合当前情况，将队首队伍轮转到队尾
+        if team_setting.fixed_team_use:
+            if (team_setting.fixed_team_use_select == 0 and not cfg.hard_mirror) or (
+                team_setting.fixed_team_use_select == 1 and cfg.hard_mirror
+            ):
+                cfg.rotate_team_queue()
+                continue
+        # 执行一次镜牢任务，根据执行结果进行处理
+        mirror_result = onetime_mir_process(team_setting, team_num)
+        if mirror_result in (MirrorRunOutcome.ABANDONED, MirrorRunOutcome.DEVELOPER_NO_REWARDS):
+            cfg.rotate_team_queue()
+            mir_times -= 1
+            if not cfg.infinite_dungeons:
+                cfg.set_value("set_mirror_count", max(0, cfg.set_mirror_count - 1))
+            mediator.mirror_signal.emit(finish_times, mir_times)
+            log.debug("本局已放弃奖励并返回主界面，扣一次计划次数，不计成功或困难奖励次数")
+            continue
+        if mirror_result:
+            cfg.rotate_team_queue()
+            mir_times -= 1
+            if cfg.hard_mirror and cfg.auto_hard_mirror:
+                chance = cfg.hard_mirror_chance - 1
+                cfg.set_value("hard_mirror_chance", chance)
+                if chance == 0:
+                    cfg.set_value("hard_mirror", False)
+
+            # 更新进度条
+            finish_times += 1
+            mediator.mirror_signal.emit(finish_times, mir_times)
+            msg = f"已完成 {finish_times} 次镜牢"
+            log.info(msg)
+            if finish_times == 1 and cfg.re_claim_rewards and not getattr(cfg, "disable_mirror_rewards", False):
+                to_get_reward()
+
+    mediator.mirror_bar_kill_signal.emit()
+    if cfg.re_claim_rewards and finish_times > 1 and not getattr(cfg, "disable_mirror_rewards", False):
+        to_get_reward()
+
+
+def script_task() -> None | int:
+    start_time = time()
+    # 获取（启动）游戏对游戏窗口进行设置
+    init_game()
+    _warn_if_game_monitor_hdr_enabled()
+
+    if cfg.skip_enkephalin:
+        log.info("设置了跳过合成脑啡肽，将不会自动合成\nSet to skip make enkephalin, it will not to do")
+    if not cfg.simulator:
+        if _get_game_rendering_scale() == 2:
+            log.warning("当前游戏渲染比例为低, 可能会导致识别错误, 建议设置为中或更高")
+        if cfg.set_win_size == 720:
+            log.warning("当前游戏分辨率为1280*720, 可能会导致识别错误或卡死, 建议设置为更高分辨率")
+
+    path_manager.initialize_paths()
+    auto.clear_img_cache()
+    log.debug(f"初始化图片路径: {path_manager.pic_path}")
+    retry_monitor.start()
+
+    if cfg.resonate_with_Ahab:
+        Resonate_with_Ahab()
+
+    # 如果是战斗中，先处理战斗
+    get_reward = None
+    if auto.click_element("battle/turn_assets.png", take_screenshot=True):
+        get_reward = battle.fight()
+
+    task_list = []
+    # 执行日常刷本任务
+    if cfg.daily_task:
+        task_list.append(Daily_task_wrapper(get_reward=get_reward))
+
+    # 执行奖励领取任务
+    if cfg.get_reward:
+        task_list.append(to_get_reward)
+
+    # 执行狂气换饼任务
+    if cfg.buy_enkephalin:
+        task_list.append(Buy_enkephalin)
+
+    # 执行镜牢任务
+    if cfg.mirror:
+        task_list.append(Mirror_task)
+
+    for task in task_list:
+        task()
+
+    if cfg.set_reduce_miscontact and not cfg.simulator:
+        # 任务已结束，这里只恢复游戏窗口样式，避免把前台重新切回游戏。
+        screen.reset_win(activate=False)
+
+    log.info("脚本任务已经完成")
+    QT_TRANSLATE_NOOP("WindowsToast", "AALC 运行结束")
+    QT_TRANSLATE_NOOP("WindowsToast", "所有任务已完成")
+    dt_start = datetime.fromtimestamp(start_time)
+    dt_end = datetime.fromtimestamp(time())
+    duration = dt_end - dt_start
+    secends = duration.total_seconds()
+    minutes, seconds = divmod(secends, 60)
+    hours, minutes = divmod(minutes, 60)
+    run_time = f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
+    send_toast(
+        "AALC 运行结束",
+        ["所有任务已完成", run_time],
+        template=TemplateToast.NormalTemplate,
+    )
+    if cfg.resonate_with_Ahab:
+        Resonate_with_Ahab()
+
+    should_exit_aalc = False
+    if platform.system() == "Windows":
+        # 收尾动作可能主动关闭游戏或模拟器。先停止截图监控，避免设备消失
+        # 被误判为断链并触发自动恢复，重新拉起刚关闭的模拟器。
+        retry_monitor.stop()
+        actions, power_action = get_after_completion_config()
+        try:
+            should_exit_aalc = execute_after_completion(actions, power_action)
+        except Exception:
+            log.exception("脚本结束后的操作失败")
+
+    if cfg.simulator:
+        if cfg.simulator_type == 0:
+            from module.automation.input_handlers.simulator.mumu_control import (
+                MumuControl,
+            )
+
+            MumuControl.clean_connect()
+
+    if should_exit_aalc:
+        return 0
+
+
+class my_script_task(QThread):
+    def __init__(self):
+        # 初始化，构造函数
+        super().__init__()
+        self.mutex = QMutex()
+
+    def run(self):
+        self.mutex.lock()
+
+        try:
+            self._run()
+        except (
+            ConnectionError,
+            userStopError,
+            unableToFindTeamError,
+            unexpectNumError,
+            cannotOperateGameError,
+            netWorkUnstableError,
+            backMainWinError,
+            withOutGameWinError,
+            notWaitError,
+            withOutPicError,
+            withOutAdminError,
+        ) as e:
+            self.exception = e
+        except Exception as e:
+            self.exception = e
+            log.exception("脚本线程执行失败")
+        finally:
+            retry_monitor.stop()
+            if auto.input_handler is not None:
+                auto.input_handler.release_active_hold()
+            self.mutex.unlock()
+
+    def terminate(self):
+        retry_monitor.stop()
+        if auto.input_handler is not None:
+            auto.input_handler.release_active_hold()
+        super().terminate()
+        # TerminateThread 不会释放被杀线程持有的 RLock,换新锁防止后续任务取锁永久阻塞
+        auto.reset_safety_locks()
+
+    """def stop(self):
+        self.running=False
+        self.finished_signal.emit()"""
+
+    def _run(self):
+        keep_awake_enabled = bool(cfg.get_value("experimental_keep_screen_awake", False))
+        try:
+            if keep_awake_enabled:
+                apply_power_keep_awake(True)
+            ret = script_task()
+            if ret == 0:
+                mediator.kill_signal.emit()
+        finally:
+            if keep_awake_enabled:
+                # 先切回 AALC 再释放线程级防息屏，避免游戏仍持有前台时继续阻止息屏。
+                mediator.request_focus.emit()
+                self.msleep(800)  # 覆盖 WinRT toast 异步归还焦点（延迟约 600ms），再释放防息屏
+                apply_power_keep_awake(False)
+            auto.clear_img_cache()

@@ -1,0 +1,394 @@
+import os
+
+import cv2
+import numpy as np
+from cv2 import createCLAHE
+from PIL import Image
+
+from module.config import cfg
+from module.logger import log
+from utils.path_manager import path_manager
+
+
+class ImageUtils:
+    @staticmethod
+    def load_image(image_path, resize=True, return_path=False):
+        """
+        加载图片，并根据指定区域裁剪图片。
+        :param image_path: 图片文件路径。
+        :param resize: 是否根据窗口大小调整图片尺寸。
+        :param return_path: 是否返回实际加载到的路径名。
+        :return: 图片数组；若 return_path=True，则返回 (图片数组, 路径名)。
+        """
+        try:
+            img_path = None
+            selected_path = None
+            for path in path_manager.pic_path:
+                img_path = os.path.join(f"./assets/images/{path}/{image_path}")
+                if os.path.exists(img_path):
+                    selected_path = path
+                    break
+            if img_path is None or not os.path.exists(img_path):
+                log.error(f"未找到图片： {image_path} ")
+                return (None, None) if return_path else None
+            # 使用上下文管理器打开图片文件，确保文件对象及时关闭
+            with Image.open(img_path) as img:
+                image = ImageUtils._prepare_loaded_image(np.array(img), resize)
+                if return_path:
+                    return image, selected_path
+                return image
+        except FileNotFoundError:
+            log.error(f"未找到图片： {image_path} ")
+            return (None, None) if return_path else None
+        except IOError:
+            log.error(f"无法读取图片： {image_path}")
+            return (None, None) if return_path else None
+        except Exception as e:
+            log.error(f"加载图片时发生错误： {e}")
+            return (None, None) if return_path else None
+
+    @staticmethod
+    def check_default_path_exists(image_path):
+        """检查图片在默认路径（非 dark）中是否存在。"""
+        for path in path_manager.pic_path:
+            if path_manager.is_path_dark(path):
+                continue
+            img_path = os.path.join(f"./assets/images/{path}/{image_path}")
+            if os.path.exists(img_path):
+                return True, path
+        return False, None
+
+    @staticmethod
+    def existing_image_paths(image_path):
+        """返回当前有效路径中存在该图片的路径列表。"""
+        paths = []
+        for path in path_manager.pic_path:
+            img_path = os.path.join(f"./assets/images/{path}/{image_path}")
+            if os.path.exists(img_path):
+                paths.append(path)
+        if path_manager.current_theme == "dark":
+            dark_paths = [path for path in paths if path_manager.is_path_dark(path)]
+            if dark_paths:
+                paths = dark_paths
+        elif path_manager.current_theme == "default":
+            paths = [path for path in paths if path_manager.is_path_default(path)]
+
+        if path_manager.current_language == "zh_cn":
+            zh_cn_paths = [path for path in paths if path_manager.is_path_zh_cn(path)]
+            if zh_cn_paths:
+                paths = zh_cn_paths
+        elif path_manager.current_language == "en":
+            en_paths = [path for path in paths if path.endswith("/en")]
+            if en_paths:
+                paths = en_paths
+            else:
+                paths = [path for path in paths if path.endswith("/share")]
+        return paths
+
+    @staticmethod
+    def load_from_specific_path(image_path, target_path, resize=True):
+        """从指定路径加载图片。"""
+        img_path = os.path.join(f"./assets/images/{target_path}/{image_path}")
+        if not os.path.exists(img_path):
+            return None
+        try:
+            with Image.open(img_path) as img:
+                return ImageUtils._prepare_loaded_image(np.array(img), resize)
+        except Exception as e:
+            log.error(f"从指定路径加载图片失败: {e}")
+            return None
+
+    @staticmethod
+    def _prepare_loaded_image(image, resize):
+        """统一处理磁盘加载出来的模板图片。"""
+        channel = image.shape[2] if len(image.shape) > 2 else 1
+        if channel > 3:
+            image = image[:, :, :3].copy()
+        if resize:
+            win_size = cfg.set_win_size
+            # 如果win_size 为2560*1440，则不变，否则将图片缩放到对应的16：9大小
+            if win_size < 1440:
+                image = cv2.resize(
+                    image,
+                    None,
+                    fx=win_size / 1440,
+                    fy=win_size / 1440,
+                    interpolation=cv2.INTER_AREA,
+                )
+            elif win_size > 1440:
+                image = cv2.resize(
+                    image,
+                    None,
+                    fx=win_size / 1440,
+                    fy=win_size / 1440,
+                    interpolation=cv2.INTER_LINEAR,
+                )
+        if len(image.shape) == 2:
+            return image
+        if image.shape[2] == 1:
+            return image[:, :, 0]
+        return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+    @staticmethod
+    def image_channel(image):
+        """
+        通过检查图像数组的维度来确定图像的通道数。
+        如果图像是三维数组，则假设第一个维度是高度，第二个维度是宽度，
+        第三个维度是通道数。如果图像是二维数组，则认为图像是单通道的。
+        :param image: 输入的图像数组，可以是二维或三维数组。
+        :return int: 图像的通道数。如果是三维数组，则返回第三维的大小；
+                    如果是二维数组，则返回0，表示单通道。
+        """
+        # 如果图像数组是三维的，则返回第三维的大小作为通道数
+        # 否则，返回0，表示图像是单通道的
+        return image.shape[2] if len(image.shape) == 3 else 0
+
+    @staticmethod
+    def get_bbox(image, threshold=0):
+        """
+        获取图像中有效区域的边界框。
+        如果图像是彩色的（具有3个通道），则首先将其转换为灰度图像，然后计算边界框。
+        :param image: numpy数组，表示输入的图像。
+        :param threshold: float，定义有效像素的阈值，默认为0。
+        :return tuple: (xmin, ymin, xmax, ymax) 表示有效区域的边界框坐标。
+        """
+        # 检查图像是否有3个通道（RGB），如果有，则转换为灰度图像
+        if ImageUtils.image_channel(image) == 3:
+            image = np.max(image, axis=2)
+        # 计算在x轴方向上有效像素的投影，并找到投影大于阈值的像素列
+        x = np.where(np.max(image, axis=0) > threshold)[0]
+        # 计算在y轴方向上有效像素的投影，并找到投影大于阈值的像素行
+        y = np.where(np.max(image, axis=1) > threshold)[0]
+        # 返回有效区域的边界框坐标
+        return x[0], y[0], x[-1] + 1, y[-1] + 1
+
+    @staticmethod
+    def crop(image, area, copy=True):
+        """
+        从图像中裁剪出指定区域。
+        如果裁剪区域超出图像边界，函数将自动调整裁剪区域，并在超出边界的部分填充黑色。
+        :param image: numpy数组，输入的图像。
+        :param area: 四元组，指定裁剪区域的左上角和右下角坐标（x1, y1, x2, y2）。
+        :param copy: 是否返回图像的一个副本。默认为True。
+        :return numpy数组，裁剪后的图像。
+        """
+        # 将裁剪区域的坐标转换为整数，以适应图像坐标系。
+        x1, y1, x2, y2 = map(int, map(round, area))
+        # 获取图像的尺寸。
+        h, w = image.shape[:2]
+        # 计算裁剪区域是否超出图像边界，如果超出，则记录需要填充的尺寸。
+        border = np.maximum((0 - y1, y2 - h, 0 - x1, x2 - w), 0)
+        # 确保裁剪区域的坐标不小于0。
+        x1, y1, x2, y2 = np.maximum((x1, y1, x2, y2), 0)
+        # 从图像中裁剪出指定区域。
+        image = image[y1:y2, x1:x2]
+        # 如果裁剪区域超出了图像边界，对裁剪后的图像进行边框填充。
+        if sum(border) > 0:
+            image = cv2.copyMakeBorder(image, *border, borderType=cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        # 如果需要，返回图像的一个副本。
+        if copy:
+            image = image.copy()
+        return image
+
+    @staticmethod
+    def get_grey_normalized_pic(img_array):
+        """
+        将传入的图片数组转为灰度模式并进行自适应直方图均衡化
+        :param img_array: 图片数组
+        :return cl1: 经过自适应直方图均衡化处理后的灰度图像
+        """
+        # 检查输入图像是否为彩色图像，如果是则转换为灰度图像
+        if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+            img = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        else:
+            img = img_array.copy()
+        # 创建自适应直方图均衡化对象，设置限制对比度的参数为2.0，划分的网格大小为8x8
+        clahe = createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # 应用自适应直方图均衡化处理，以改善图像的对比度
+        cl1 = clahe.apply(img)
+        return cl1
+
+    @staticmethod
+    def match_template(screenshot, template, bbox, model="clam"):
+        try:
+            shape = screenshot.shape
+            if len(shape) == 2:
+                height, width = shape
+            elif len(shape) == 3:
+                height, width, _ = shape
+            if model == "normal":
+                if bbox:
+                    bbox = (
+                        max(bbox[0] - 100, 0),  # 确保左上角 x 坐标不小于 0
+                        max(bbox[1] - 100, 0),  # 确保左上角 y 坐标不小于 0
+                        min(bbox[2] + 100, width),  # 确保右下角 x 坐标不大于 图片宽
+                        min(bbox[3] + 100, height),  # 确保右下角 y 坐标不大于 图片高
+                    )
+            else:
+                if bbox:
+                    bbox = (
+                        max(bbox[0] - 30, 0),  # 确保左上角 x 坐标不小于 0
+                        max(bbox[1] - 30, 0),  # 确保左上角 y 坐标不小于 0
+                        min(bbox[2] + 30, width),  # 确保右下角 x 坐标不大于 图片宽
+                        min(bbox[3] + 30, height),  # 确保右下角 y 坐标不大于 图片高
+                    )
+            if bbox is not None and model != "aggressive":
+                screenshot_crop = screenshot[bbox[1] : bbox[3], bbox[0] : bbox[2]]
+                result = cv2.matchTemplate(screenshot_crop, template, cv2.TM_CCOEFF_NORMED)
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                h, w = template.shape[:2]
+                center = (bbox[0] + max_loc[0] + w // 2, bbox[1] + max_loc[1] + h // 2)
+                return center, max_val
+            else:
+                result = cv2.matchTemplate(screenshot, template, cv2.TM_CCOEFF_NORMED)
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                h, w = template.shape[:2]
+                center = (int(max_loc[0]) + w // 2, int(max_loc[1]) + h // 2)
+                return center, max_val
+        except Exception as e:
+            log.error(f"图片识别出现错误：{e}")
+
+    @staticmethod
+    def match_template_with_multiple_targets(screenshot, template, threshold, min_dist=10):
+        # 获取模板的宽度和高度
+        w, h = ImageUtils.get_image_info(template)
+        # 存储所有匹配位置的中心点
+        center_points = []
+        # 使用matchTemplate对图片进行模板匹配
+        res = cv2.matchTemplate(screenshot, template, cv2.TM_CCOEFF_NORMED)
+        # 遍历所有超过阈值的区域
+        loc = np.where(res >= threshold)
+        points = zip(*loc[::-1])
+        # 对匹配结果进行排序，根据匹配度得分从高到低
+        sorted_points = sorted(points, key=lambda x: res[x[1], x[0]], reverse=True)
+        # 遍历排序后的匹配位置
+        if sorted_points:
+            for pt in sorted_points:
+                # 检查当前匹配点是否与已保留的匹配点太近
+                if all(np.linalg.norm(np.array(pt) - np.array(kept_pt)) > min_dist for kept_pt in center_points):
+                    # 如果没有太近的匹配点，保留当前匹配点
+                    center_points.append(pt)
+            # 计算每个匹配点的中心坐标
+            center_points = [(int(pt[0] + w / 2), int(pt[1] + h / 2)) for pt in center_points]
+            return center_points
+        log.debug(f"未找到匹配项，最高匹配度为：{np.max(res)}")
+        return []
+
+    @staticmethod
+    def match_color_regions(
+        image,
+        mask_fn,
+        roi=None,
+        min_area=300,
+        min_dist=80,
+        close_size=3,
+        close_iter=2,
+    ):
+        """
+        颜色区域计数：mask_fn 在 ROI 内生成前景掩码，闭运算合并后按连通域计数。
+
+        Args:
+            image: 彩色 RGB ndarray（如彩色截图）
+            mask_fn: callable(ROI的RGB ndarray) -> uint8 掩码(0/255)
+            roi: (x1, y1, x2, y2) **1440 高度基准坐标**，函数内部按实际图像高度自动缩放，
+                 None 为全图；返回坐标为实际图像坐标系
+            min_area: 1440 高度基准下，连在一起的前景区域至少包含多少像素才保留
+            min_dist: 质心合并最小距离（1440 基准，按 scale 换算）
+            close_size/close_iter: 闭运算核边长与迭代次数（合并徽章内的字母笔画，0/负值关闭）
+
+        Returns:
+            list[(cx, cy, area)]: 各颜色区域质心与面积；无匹配返回 []，匹配出错返回 None
+        """
+        try:
+            # 缩放比 = 截图实际高度 / 1440，下列所有以 1440 为基准的量都按它换算
+            scale = image.shape[0] / 1440
+            if roi:
+                # ROI 以 1440 基准书写，缩放到实际分辨率后裁剪出进度条横带；返回坐标需加回偏移
+                scaled = [int(round(v * scale)) for v in roi]
+                offset = (scaled[0], scaled[1])
+                work = ImageUtils.crop(image, scaled)
+            else:
+                offset = (0, 0)
+                work = image
+            # 前景掩码：mask_fn 判定目标颜色像素（如 CLEAR 红字母），命中 255、其余 0
+            mask = np.asarray(mask_fn(work), dtype=np.uint8)
+            if mask.shape != work.shape[:2]:
+                raise ValueError(f"掩码尺寸 {mask.shape} 与 ROI {work.shape[:2]} 不一致")
+            # 闭运算：把同一标记内部的笔画间隙连成一整块，避免一枚标记数成多个连通域
+            if close_size > 0 and close_iter > 0:
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=close_iter)
+            # 面积是二维量，阈值按 scale² 换算，过滤抗锯齿碎屑
+            min_a = max(1, int(min_area * scale * scale))
+            # 连通域计数：label 0 是背景，从 1 开始遍历
+            count, _, stats, centroids = cv2.connectedComponentsWithStats(mask)
+            regions = []
+            for i in range(1, count):
+                area = stats[i, cv2.CC_STAT_AREA]
+                if area >= min_a:
+                    regions.append((centroids[i][0] + offset[0], centroids[i][1] + offset[1], area))
+            # 质心去重：同一标记的残留碎块按面积从大到小保留，距已保留质心不足 min_dist 的合并
+            merged = []
+            for cx, cy, area in sorted(regions, key=lambda r: -r[2]):
+                if all(np.hypot(cx - mx, cy - my) > min_dist * scale for mx, my, _ in merged):
+                    merged.append((int(cx), int(cy), area))
+            return merged
+        except Exception as e:
+            log.error(f"颜色区域匹配出错：{e}")
+            return None
+
+    @staticmethod
+    def get_image_info(image_array):
+        """
+        获取图片的信息，如尺寸。
+        :param image_array: 图片的 numpy 数组。
+        :return: 图片的宽度和高度。
+        """
+        return image_array.shape[::-1]
+
+    @staticmethod
+    def feature_matching(template_img, target_img, min_matches=8):
+        # 读取图像并进行预处理
+
+        template = cv2.resize(template_img, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+        target = cv2.resize(target_img, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+
+        # 使用ORB特征检测器
+        orb = cv2.ORB_create(nfeatures=1000, scaleFactor=1.2, edgeThreshold=10)
+
+        # 检测关键点和描述符
+        kp1, des1 = orb.detectAndCompute(template, None)
+        kp2, des2 = orb.detectAndCompute(target, None)
+
+        # 使用FLANN匹配器
+        FLANN_INDEX_LSH = 6
+        index_params = dict(algorithm=FLANN_INDEX_LSH, table_number=6, key_size=12, multi_probe_level=1)
+        search_params = dict(checks=50)
+        flann = cv2.FlannBasedMatcher(index_params, search_params)
+
+        matches = flann.knnMatch(des1, des2, k=2)
+
+        # 比率测试
+        good_matches = []
+        for match in matches:
+            if len(match) >= 2:
+                m, n = match
+                if m.distance < 0.7 * n.distance:
+                    good_matches.append(m)
+
+        if len(good_matches) >= min_matches:
+            # 获取匹配点的坐标
+            src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches])
+            dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches])
+
+            # 计算单应性矩阵
+            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+            # 计算匹配置信度评分
+            inlier_ratio = np.sum(mask) / len(mask)
+            if inlier_ratio < 0.3:  # 如果内点比例过低，认为匹配不可靠
+                return False, len(good_matches)
+
+            return True, len(good_matches)
+        else:
+            return False, len(good_matches)

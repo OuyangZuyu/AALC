@@ -1,0 +1,49 @@
+from PySide6.QtCore import QObject, Signal
+
+
+class Mediator(QObject):
+    switch_page = Signal(str)
+    switch_team_setting = Signal(str)
+    delete_team_setting = Signal(str)
+    team_setting = Signal(dict)
+    close_setting = Signal()
+    refresh_teams_order = Signal()
+    autodaily_setting = Signal(str)
+    sinner_be_selected = Signal()
+    link_start = Signal()
+    save_warning = Signal()
+    tasks_warning = Signal()
+    update_progress = Signal(int)
+    download_complete = Signal(str)
+    warning = Signal(str)
+    hdr_warning = Signal(object)
+    finished_signal = Signal()
+    script_finished = Signal()
+    kill_signal = Signal()
+    pause_resume = Signal()
+    # 收尾动作抑制开关变化时广播，界面据此切换"结束后操作"摘要的显示口径。
+    completion_suppressed_changed = Signal(bool)
+    # 任务线程通过信号请求主窗口抢回前台，避免跨层直接操作 UI。
+    request_focus = Signal()
+    mirror_signal = Signal(int, int)  # 运行的当前次数和总次数
+    mirror_bar_kill_signal = Signal()
+    hotkey_listener_stop_signal = Signal()
+    hotkey_listener_start_signal = Signal()
+
+    # 单例实例（类变量）
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            # 创建新实例
+            cls._instance = super().__new__(cls)
+            # 显式调用父类构造函数
+            super(cls, cls._instance).__init__()
+            # 初始化标志
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if not hasattr(self, "_initialized") or not self._initialized:
+            # 这里不需要再调用 super().__init__()，因为已经在 __new__ 中调用过了
+            self._initialized = True

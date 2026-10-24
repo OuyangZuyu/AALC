@@ -1,0 +1,740 @@
+import ctypes
+import os
+import re
+import subprocess
+import sys
+from enum import Enum
+
+from PySide6.QtCore import (
+    QEvent,
+    QLocale,
+    QRect,
+    Qt,
+    QThread,
+    QTimer,
+)
+from PySide6.QtGui import QAction, QCursor, QIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QStackedWidget,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
+from qfluentwidgets import (
+    ProgressRing,
+    RoundMenu,
+    Theme,
+    isDarkTheme,
+    qconfig,
+    setTheme,
+    setThemeColor,
+)
+from qfluentwidgets.components.widgets.frameless_window import FramelessWindow
+from qframelesswindow import StandardTitleBar
+from qframelesswindow.titlebar.title_bar_buttons import TitleBarButtonState
+
+from app import AnnouncementStatus, mediator
+from app.announcement_board import AnnouncementBoard, AnnouncementThread
+from app.card.messagebox_custom import MessageBoxConfirm, MessageBoxWarning
+from app.custom_pivot import FullWidthPivot
+from app.farming_interface import FarmingInterface
+from app.language_manager import LanguageManager
+from app.page_card import MarkdownViewer
+from app.resource_sync_coordinator import ResourceSyncCoordinator
+from app.setting_interface import SettingInterface
+from app.team_setting_card import TeamSettingCard
+from app.tools_interface import ToolsInterface
+from module.after_completion_types import (
+    LEGACY_AFTER_COMPLETION_TO_CONFIG,
+    POWER_ACTION_NONE,
+    normalize_after_completion_config,
+)
+from module.config import cfg
+from module.font_manager import font_manager
+from module.logger import log
+from module.system_actions import autodaily_exit_to_after_completion_config, suspend_completion_actions
+
+# WinRT toast / Win32 焦点切换存在异步回跳，这里保留一次延迟补偿。
+_FOREGROUND_RETRY_DELAY_MS = 600
+
+
+class Language(Enum):
+    """Language enumeration"""
+
+    CHINESE_SIMPLIFIED = QLocale(QLocale.Language.Chinese, QLocale.Country.China)
+    CHINESE_TRADITIONAL = QLocale(QLocale.Language.Chinese, QLocale.Country.HongKong)
+    ENGLISH = QLocale(QLocale.Language.English)
+    AUTO = QLocale()
+
+
+from app.common.ui_config import (
+    apply_font_config,
+    get_main_window_style,
+    get_title_bar_style,
+)
+from app.widget.dev_watermark import DevWatermark
+
+
+# 自定义托盘菜单，处理鼠标在外部释放时关闭菜单
+class TrayRoundMenu(RoundMenu):
+    def mouseReleaseEvent(self, e):
+        if not self.rect().contains(e.pos()):
+            self.close()
+        else:
+            super().mouseReleaseEvent(e)
+
+
+# 使用无框窗口
+class MainWindow(FramelessWindow):
+    def __init__(self, argv: list[str]):
+        super().__init__()
+
+        self._pending_start_commands: list[list[str]] = []
+        self._scheduled_start_pending = False
+        self._scheduled_start_command: list[str] | None = None
+
+        # 应用全局字体配置
+        apply_font_config()
+
+        self.setTitleBar(StandardTitleBar(self))
+        self.setWindowIcon(QIcon("./assets/logo/my_icon_256X256.ico"))
+        self.setWindowTitle(f"Ahab Assistant Limbus Company - {cfg.version}")
+        self.setObjectName("MainWindow")
+        setThemeColor("#9c080b")
+        LanguageManager().register_component(self)
+
+        # Apply theme
+        setTheme(getattr(Theme, cfg.get_value("theme_mode", "AUTO"), Theme.AUTO))
+
+        # 监听主题变化
+        qconfig.themeChanged.connect(self._apply_theme_styles)
+        self._apply_theme_styles()
+
+        # 禁用最大化
+        self.titleBar.maxBtn.setHidden(True)
+        self.titleBar.maxBtn.setDisabled(True)
+        self.titleBar.setDoubleClickEnabled(False)
+        self.setResizeEnabled(False)
+
+        # 进度环（用于显示下载/更新进度）
+        self.progress_ring = ProgressRing(self)
+        self.progress_ring.hide()
+
+        # 展示有可更新图片资源，默认隐藏，仅在检查到更新或同步完成后显示。
+        self.resource_sync_status_label = QLabel(self.titleBar)
+        self.resource_sync_status_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.resource_sync_status_label.hide()
+        self.titleBar.hBoxLayout.insertWidget(3, self.resource_sync_status_label, 0, Qt.AlignLeft)
+
+        self.resize(1080, 600)
+        # 恢复窗口位置
+        saved_x = cfg.get_value("window_position_x", None)
+        saved_y = cfg.get_value("window_position_y", None)
+        if saved_x is not None and saved_y is not None:
+            screen = QApplication.screenAt(QRect(saved_x, saved_y, self.width(), self.height()).center())
+            if screen:
+                self.move(saved_x, saved_y)
+            else:
+                # 重置为默认居中位置
+                screen = QApplication.primaryScreen()
+                geometry = screen.availableGeometry() if screen else self.geometry()
+                w, h = geometry.width(), geometry.height()
+                self.move(w // 2 - self.width() // 2, h // 2 - self.height() // 2)
+        else:
+            # 默认居中
+            screen = QApplication.primaryScreen()
+            geometry = screen.availableGeometry() if screen else self.geometry()
+            w, h = geometry.width(), geometry.height()
+            self.move(w // 2 - self.width() // 2, h // 2 - self.height() // 2)
+
+        self.pivot = FullWidthPivot()  # 顶部 Tab 导航栏
+        self.stackedWidget = QStackedWidget()  # 页面容器（一次只显示一个页面）
+        self.vBoxLayout = QVBoxLayout(self)  # 主布局（垂直）
+        self.HBoxLayout = QHBoxLayout()  # 水平布局
+        # self.stackedWidget.setStyleSheet("border: 1px solid black;")
+
+        # 创建子界面
+        self.farming_interface = FarmingInterface(self)
+        self.tools_interface = ToolsInterface(self)
+        self.setting_interface = SettingInterface(self)
+        # 由独立协调类统一接管资源同步编排，主窗口只保留界面接缝。
+        self.resource_sync_coordinator = ResourceSyncCoordinator(
+            window=self,
+            status_label=self.resource_sync_status_label,
+            startup_argv=list(argv),
+            continue_startup=lambda: self._continue_main_startup_sequence(list(argv)),
+            set_progress=self.set_progress_ring,
+            has_running_script=self._has_running_script,
+        )
+        # 设置页只负责发信号，由协调类统一接管手动资源同步入口。
+        self.setting_interface.manualResourceSyncRequested.connect(
+            self.resource_sync_coordinator.start_manual_resource_sync_check
+        )
+        # self.team_setting = TeamSettingCard(self)
+
+        # 向 pivot 添加子界面
+        self.addSubInterface(self.farming_interface, "farming_interface", "一键长草")
+        if cfg.language_in_program == "zh_cn":
+            self.help_interface = MarkdownViewer("./assets/doc/zh/How_to_use.md")
+        else:
+            self.help_interface = MarkdownViewer("./assets/doc/en/How_to_use_EN.md")
+        self.addSubInterface(self.help_interface, "help_interface", "帮助")
+        self.addSubInterface(self.tools_interface, "tools_interface", "小工具")
+        self.addSubInterface(self.setting_interface, "setting_interface", "设置")
+        # self.addSubInterface(self.team_setting, 'team_setting', '队伍设置')
+
+        self.HBoxLayout.addWidget(self.pivot)
+        self.vBoxLayout.addSpacing(10)
+        self.vBoxLayout.addLayout(self.HBoxLayout, 0)
+        self.vBoxLayout.addWidget(self.stackedWidget)
+        self.vBoxLayout.setContentsMargins(30, 20, 30, 0)
+        self.pivot.setMaximumHeight(50)
+
+        # Tab 切换逻辑：点击 Tab 时切换对应页面
+        self.pivot.currentItemChanged.connect(lambda k: self.stackedWidget.setCurrentWidget(self.findChild(QWidget, k)))
+        self.pivot.setCurrentItem(self.farming_interface.objectName())  # 设置默认Tab
+
+        # 標題置頂
+        self.titleBar.raise_()
+        # Dev Watermark
+        if os.environ.get("AALC_DEV_MODE") == "1" or not getattr(sys, "frozen", False):
+            self.dev_watermark = DevWatermark(self)
+            self.dev_watermark.move(0, 0)
+            self.dev_watermark.raise_()
+
+        self.connect_mediator()
+
+        self.show()
+
+        # 初始化进度环
+        self.set_ring()
+        # 启动阶段先走软件更新检查，再决定是否继续执行资源同步。
+        self.resource_sync_coordinator.start_startup_check()
+
+        # 判断是否需要降低缩放以适配小屏幕
+        screen_rect = self.screen().availableGeometry()  # 获取到的rect会经过缩放因子的缩放
+        self_rect = self.geometry()
+        if screen_rect.width() < self_rect.width() or screen_rect.height() < self_rect.height():
+            log.info("屏幕分辨率较小，自动降低缩放以适配界面，将在重启后生效")
+            screen_width = screen_rect.width() * cfg.zoom_scale / 100
+            screen_height = screen_rect.height() * cfg.zoom_scale / 100
+            scale_factor = int(min(screen_width / self_rect.width(), screen_height / self_rect.height()) * 100)
+            if scale_factor <= 0:
+                scale_factor = self.screen().logicalDotsPerInch() / 96 * 100
+            if scale_factor < 50:
+                scale_factor = 50
+                log.warning("计算得到的缩放因子小于最低预设值，调整为50%")
+            elif scale_factor < 75:
+                scale_factor = 50
+            elif scale_factor < 90:
+                scale_factor = 75
+            elif scale_factor < 100:
+                scale_factor = 90
+            elif scale_factor < 125:
+                scale_factor = 100
+            elif scale_factor < 150:
+                scale_factor = 125
+            elif scale_factor < 175:
+                scale_factor = 150
+            elif scale_factor < 200:
+                scale_factor = 175
+            else:
+                scale_factor = 200
+                log.warning("计算得到的缩放因子大于最高预设值，调整为200%")
+            cfg.set_value("zoom_scale", scale_factor)
+
+    def init_system_tray(self):
+        """初始化系统托盘图标与点击事件。"""
+        # 创建系统托盘对象，并绑定主窗口的激活处理逻辑。
+        self.tray_menu = None
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(QIcon("./assets/logo/my_icon_256X256.ico"))
+        self.tray_icon.activated.connect(self.on_tray_icon_activated)
+        self.tray_icon.show()
+
+    def _continue_main_startup_sequence(self, argv: list[str]) -> None:
+        """
+        继续执行启动链路。
+        """
+
+        self.show_announcement_board()
+        self.command_start(argv)
+        self.init_system_tray()
+
+    def _has_running_script(self) -> bool:
+        """判断当前是否存在正在运行的主脚本任务。
+
+        返回:
+            若主脚本线程仍在运行则返回 True，否则返回 False。
+        """
+        # 直接查询左侧主脚本线程状态，用于阻止运行中插入资源替换。
+        script = self.farming_interface.interface_left.my_script
+        return script is not None and script.isRunning()
+
+    def restore_window(self):
+        """Restore window from minimized/hidden state and reset title bar button states"""
+        # 避免最小化按钮处于focus状态
+        for btn in [self.titleBar.minBtn, self.titleBar.closeBtn, self.titleBar.maxBtn]:
+            btn.setState(TitleBarButtonState.NORMAL)
+
+        # 隐藏从托盘恢复时短暂显示的白色窗口
+        if not self.isVisible():
+            self.setWindowOpacity(0)
+            self.showNormal()
+            QTimer.singleShot(0, lambda: self.setWindowOpacity(1))
+        else:
+            self.showNormal()
+
+        self.raise_()
+        self.activateWindow()
+
+    def on_tray_icon_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger or reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            if self.tray_menu:
+                self.tray_menu.close()
+                self.tray_menu = None
+            self.restore_window()
+
+        elif reason == QSystemTrayIcon.ActivationReason.Context:
+            if self.tray_menu:
+                self.tray_menu.close()
+
+            self.tray_menu = TrayRoundMenu(parent=self)
+
+            show_action = QAction(self.tr("打开主窗口"), self)
+            show_action.triggered.connect(self.restore_window)
+            quit_action = QAction(self.tr("退出"), self)
+            quit_action.triggered.connect(self.on_tray_quit)
+
+            self.tray_menu.addAction(show_action)
+            self.tray_menu.addAction(quit_action)
+
+            # 菜单位置
+            self.tray_menu.adjustSize()
+            pos = QCursor.pos()
+            pos.setY(pos.y() - self.tray_menu.sizeHint().height() - 25)
+            pos.setX(pos.x() + 5)
+
+            self.activateWindow()
+            self.tray_menu.exec(pos)
+            self.tray_menu = None
+
+    def on_tray_quit(self):
+        """托盘退出入口，统一走 close() 让 closeEvent() 处理确认与收尾"""
+        # close() 对隐藏窗口不生效，需先确保窗口可见
+        if not self.isVisible():
+            self.restore_window()
+        self.close()
+
+    def command_start(self, argv: list[str]):
+        """通过命令行参数控制程序启动行为"""
+        # 初始化控制符
+        log.debug(f"接收到命令行参数: {argv}")
+        if self._is_start_command(argv) and (self._has_running_script() or self._scheduled_start_pending):
+            self._pending_start_commands.append(list(argv))
+            self._set_completion_actions_suspended(True)
+            log.info(
+                "当前已有任务正在执行或等待启动，新的自动任务已排队（队列长度：%s）",
+                len(self._pending_start_commands),
+            )
+            return
+
+        skip_arg_times = 0
+        start_flag = False
+        exit_flag = False
+        exit_type = 0
+        parsed_actions = None
+        parsed_power_action = None
+        last_cmd = ""
+        # 读取输入参数
+        for index, arg in enumerate(argv):
+            if index == 0:
+                # 跳过第一个参数（程序路径）
+                continue
+            if skip_arg_times > 0:
+                # 读取参数后可以跳过的次数
+                # 运行一个控制语句读取多个参数
+                skip_arg_times -= 1
+                continue
+            if arg == "start":
+                start_flag = True
+                last_cmd = "start"
+                continue
+            if arg == "--exit" and last_cmd == "start":
+                exit_flag = True
+                skip_arg_times = 1
+                exit_type = 5
+                try:
+                    if isinstance(argv[index + 1], str) and argv[index + 1].startswith("autodaily"):
+                        exit_task = cfg.get_value(argv[index + 1] + "_task_exit")
+                        actions, power_action = autodaily_exit_to_after_completion_config(exit_task)
+                        parsed_actions = actions
+                        parsed_power_action = power_action
+                        exit_type = 0
+                        autodaily_task = cfg.get_value(argv[index + 1] + "_task")
+                        if autodaily_task[0]:
+                            self.farming_interface.interface_left.daily_task.box.set_check_true()
+                        else:
+                            self.farming_interface.interface_left.daily_task.box.set_check_false()
+                        if autodaily_task[1]:
+                            self.farming_interface.interface_left.get_reward.box.set_check_true()
+                        else:
+                            self.farming_interface.interface_left.get_reward.box.set_check_false()
+                        if autodaily_task[2]:
+                            self.farming_interface.interface_left.buy_enkephalin.box.set_check_true()
+                        else:
+                            self.farming_interface.interface_left.buy_enkephalin.box.set_check_false()
+                        if autodaily_task[3]:
+                            self.farming_interface.interface_left.mirror.box.set_check_true()
+                        else:
+                            self.farming_interface.interface_left.mirror.box.set_check_false()
+                    else:
+                        exit_type = int(argv[index + 1])
+                        if exit_type < 0 or exit_type > 8:
+                            exit_type = 0
+                            log.error(f'命令行参数 --exit 后输入值"{argv[index + 1]}"越界')
+                except (IndexError, ValueError):
+                    # 由于输入值为可选, 所以在强制int失败或缺少时将跳过参数数值重置为0
+                    skip_arg_times = 0
+                    log.info("命令行参数 --exit 后缺少退出类型，默认为5, 即退出AALC")
+                except Exception as e:
+                    exit_type = 0
+                    skip_arg_times = 0
+                    log.error(f"命令行参数 --exit 未知错误: {e}")
+                continue
+
+        # 最终执行操作
+        if exit_flag:
+            if parsed_actions is not None and parsed_power_action is not None:
+                actions, power_action = parsed_actions, parsed_power_action
+            else:
+                # 兼容旧命令行数字参数
+                actions, power_action = normalize_after_completion_config(
+                    *LEGACY_AFTER_COMPLETION_TO_CONFIG.get(exit_type, ((), POWER_ACTION_NONE))
+                )
+            self.farming_interface.interface_left.after_completion_selector.set_from_external(actions, power_action)
+
+        if start_flag:
+            log.info("开始通过命令行参数启动程序")
+            self._scheduled_start_pending = True
+            self._scheduled_start_command = list(argv)
+            QTimer.singleShot(3000, self._emit_scheduled_start)
+
+    @staticmethod
+    def _is_start_command(argv: list[str]) -> bool:
+        return "start" in argv[1:]
+
+    def _emit_scheduled_start(self) -> None:
+        if self._has_running_script():
+            if self._scheduled_start_command is not None:
+                self._pending_start_commands.insert(0, self._scheduled_start_command)
+                self._set_completion_actions_suspended(True)
+                log.info(
+                    "自动任务等待启动期间检测到其他任务，已转入队列（队列长度：%s）",
+                    len(self._pending_start_commands),
+                )
+            self._scheduled_start_pending = False
+            self._scheduled_start_command = None
+            return
+
+        self._scheduled_start_pending = False
+        self._scheduled_start_command = None
+        self._set_completion_actions_suspended(bool(self._pending_start_commands))
+        mediator.finished_signal.emit()
+        if not self._has_running_script():
+            self._schedule_next_queued_start()
+
+    def _set_completion_actions_suspended(self, suspended: bool) -> None:
+        """切换收尾动作抑制开关，并广播给界面刷新结束后的操作摘要。
+
+        队列尚有后续任务时置为 True，禁止当前任务关闭程序、模拟器或执行电源操作。
+        """
+        suspend_completion_actions(suspended)
+        mediator.completion_suppressed_changed.emit(suspended)
+
+    def _schedule_next_queued_start(self) -> None:
+        if self._pending_start_commands:
+            QTimer.singleShot(250, self._start_next_queued_command)
+        elif not self._scheduled_start_pending:
+            self._set_completion_actions_suspended(False)
+
+    def _start_next_queued_command(self) -> None:
+        if not self._pending_start_commands:
+            return
+        if self._has_running_script() or self._scheduled_start_pending:
+            QTimer.singleShot(250, self._start_next_queued_command)
+            return
+
+        argv = self._pending_start_commands.pop(0)
+        log.info("当前任务已结束，开始执行排队的自动任务（剩余：%s）", len(self._pending_start_commands))
+        self.command_start(argv)
+        if self._pending_start_commands:
+            self._set_completion_actions_suspended(True)
+
+    def _apply_theme_styles(self):
+        is_dark = isDarkTheme()
+        mainWindow_style = get_main_window_style(is_dark)
+        titleBar_style = get_title_bar_style(is_dark)
+
+        self.setStyleSheet(f"MainWindow {{ background-color: {mainWindow_style['bg_color']}; }}")
+        self.titleBar.titleLabel.setStyleSheet(
+            f"QLabel {{ background: transparent; font-size: 13px; padding: 0 4px; color: {titleBar_style['text_color']}; }}"
+        )
+        for btn in [self.titleBar.minBtn, self.titleBar.maxBtn, self.titleBar.closeBtn]:
+            btn.setNormalColor(titleBar_style["btn_color"])
+            btn.setHoverColor(titleBar_style["btn_color"])
+            btn.setPressedColor(titleBar_style["btn_color"])
+        if not is_dark:
+            self.titleBar.closeBtn.setHoverColor(Qt.white)
+        if hasattr(self, "resource_sync_coordinator"):
+            self.resource_sync_coordinator.apply_status_style(is_dark)
+
+    def closeEvent(self, e):
+        # 保存窗口位置
+        cfg.set_value("window_position_x", self.x())
+        cfg.set_value("window_position_y", self.y())
+
+        if (
+            self.farming_interface.interface_left.my_script is not None
+            and self.farming_interface.interface_left.my_script.isRunning()
+        ):
+            # 确保窗口可见，以便正确显示确认对话框
+            if not self.isVisible():
+                self.showNormal()
+                self.raise_()
+                self.activateWindow()
+
+            message_box = MessageBoxConfirm(
+                self.tr("有正在进行的任务"),
+                self.tr("脚本正在运行中，确定要退出程序吗？"),
+                self.window(),
+            )
+            if message_box.exec():
+                self.farming_interface.interface_left.my_script.terminate()
+            else:
+                e.ignore()
+                return
+
+        if self.tools_interface.tools:
+            message_box = MessageBoxConfirm(
+                self.tr("有正在运行的工具"),
+                self.tr("有工具正在运行中，确定要退出程序吗？"),
+                self.window(),
+            )
+            if message_box.exec():
+                for tool in self.tools_interface.tools.values():
+                    if isinstance(tool.w, QWidget):
+                        tool.w.close()
+                    elif isinstance(tool.w, QThread):
+                        tool.w.terminate()
+            else:
+                e.ignore()
+                return
+        return super().closeEvent(e)
+
+    def changeEvent(self, event):
+        # 监听窗口状态改变事件
+        if event.type() == QEvent.WindowStateChange:
+            # 如果窗口被最小化
+            if self.windowState() & Qt.WindowMinimized:
+                # 检查是否启用了“最小化到托盘”选项
+                if cfg.get_value("minimize_to_tray", False):
+                    # 为了确保最小化到托盘的效果，延迟调用 hide()
+                    QTimer.singleShot(0, self.hide)
+                    self.tray_icon.show()
+        super().changeEvent(event)
+
+    def addSubInterface(self, widget: QLabel, objectName, text):
+        widget.setObjectName(objectName)
+        # widget.setAlignment(Qt.AlignCenter)
+        self.stackedWidget.addWidget(widget)
+        self.pivot.addItem(routeKey=objectName, text=text)
+
+    def add_and_switch_to_page(self, target: str):
+        try:
+            num = int(re.search(r"team(\d+)_setting", target).group(1))
+            if "team_setting" in list(self.pivot.items.keys()):
+                list(self.pivot.items.values())[-1].click()
+                message = self.tr("存在未保存的队伍设置")
+                mediator.warning.emit(message)
+                self.pivot.setCurrentItem("team_setting")
+            else:
+                """切换页面（带越界保护）"""
+                self.addSubInterface(TeamSettingCard(num), "team_setting", self.tr("队伍设置"))
+                QTimer.singleShot(0, lambda: self.pivot.setCurrentItem("team_setting"))
+        except Exception as e:
+            log.error(f"【异常】switch_to_page 出错：{type(e).__name__}:{e}", exc_info=True)
+
+    def close_setting_page(self):
+        try:
+            list(self.pivot.items.values())[0].click()
+            page = self.findChild(TeamSettingCard, "team_setting")
+
+            # 断开信号连接
+            page.disconnect_mediator()
+
+            # 注销翻译组件
+            LanguageManager().unregister_component(page)
+            LanguageManager().unregister_component(page.customize_settings_module)
+            LanguageManager().unregister_component(page.customize_info_module)
+
+            self.stackedWidget.removeWidget(page)
+            page.setParent(None)
+            page.deleteLater()
+            del page
+            self.pivot.removeWidget("team_setting")
+            font_manager.unload_font("./assets/app/fonts/ChineseFont.ttf")
+        except Exception as e:
+            log.error(f"delete_team 出错：{e}")
+
+    def show_save_warning(self):
+        MessageBoxWarning(
+            self.tr("设置未保存"),
+            self.tr("存在未保存的设置，请执行保存或取消操作"),
+            self,
+        ).exec()
+
+    def show_warning(self, warning: str):
+        MessageBoxWarning(self.tr("警告！"), warning, self).exec()
+
+    def show_hdr_warning(self, acknowledged_event):
+        try:
+            MessageBoxWarning(
+                self.tr("检测到 HDR 已开启"),
+                self.tr(
+                    "检测到游戏所在显示器已开启 HDR。开启 HDR 可能导致图像识别问题；"
+                    "如果运行中遇到识别异常，请先关闭 Windows HDR 后重试。\n\n"
+                    "如果不想再看到本通知，请在“设置 > 实验性内容”中关闭“HDR 检测警告”。"
+                ),
+                self,
+            ).exec()
+        except Exception as exc:
+            log.error(f"显示 HDR 警告失败: {exc}")
+        finally:
+            acknowledged_event.set()
+
+    def show_tasks_warning(self):
+        MessageBoxWarning(
+            self.tr("任务设置出错"),
+            self.tr("未设置任何任务，请勾选主页面左边的选项框需要执行的任务"),
+            self,
+        ).exec()
+
+    def connect_mediator(self):
+        # 连接所有可能信号
+        mediator.switch_team_setting.connect(self.add_and_switch_to_page)
+        mediator.close_setting.connect(self.close_setting_page)
+        mediator.save_warning.connect(self.show_save_warning)
+        mediator.tasks_warning.connect(self.show_tasks_warning)
+        mediator.update_progress.connect(self.set_progress_ring)
+        mediator.download_complete.connect(self.download_and_install)
+        mediator.warning.connect(self.show_warning)
+        mediator.hdr_warning.connect(self.show_hdr_warning)
+        # 由任务线程发起请求、由主窗口执行前台切换，避免执行层直接耦合 UI。
+        mediator.request_focus.connect(self._force_foreground)
+        mediator.script_finished.connect(self._schedule_next_queued_start)
+
+    def _force_foreground(self) -> None:
+        """强制将 AALC 主窗口拉至前台，绕过 Windows 焦点保护。
+        执行两次（立即 + 延迟补偿），覆盖 WinRT toast 通知在异步阶段归还焦点的行为。
+        """
+        self._do_force_foreground()
+        QTimer.singleShot(_FOREGROUND_RETRY_DELAY_MS, self._do_force_foreground)
+
+    def _do_force_foreground(self) -> None:
+        if os.name != "nt":
+            return
+        if not self.isVisible():
+            self.showNormal()
+        hwnd = int(self.winId())
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        hwnd_fg = user32.GetForegroundWindow()
+        if hwnd_fg == 0:
+            log.debug("未获取到当前前台窗口，跳过本次焦点切换")
+            return
+        if hwnd_fg == hwnd:
+            return
+        thread_fg = user32.GetWindowThreadProcessId(hwnd_fg, None)
+        if thread_fg == 0:
+            log.debug("未获取到前台线程，跳过本次焦点切换")
+            return
+        thread_cur = kernel32.GetCurrentThreadId()
+        attached = thread_fg != thread_cur
+        if attached:
+            # 借用当前前台线程的输入队列权限，降低 SetForegroundWindow 被系统忽略的概率。
+            user32.AttachThreadInput(thread_fg, thread_cur, True)
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(thread_fg, thread_cur, False)
+        self.raise_()
+        self.activateWindow()
+
+    def set_ring(self):
+        self.progress_ring.raise_()  # 保持最上层显示
+        self.progress_ring.setValue(0)
+        self.progress_ring.setTextVisible(True)
+        self.progress_ring.setFixedSize(80, 80)
+        x = self.width() - 100
+        y = self.height() - 100
+        self.progress_ring.move(x, y)
+
+    def set_progress_ring(self, value: int):
+        self.progress_ring.show()
+        self.progress_ring.raise_()  # 保持最上层显示
+        self.progress_ring.setValue(value)
+
+    def handle_link_click(self, url: str):
+        """处理帮助文档中的链接点击"""
+        if url.endswith(".md"):
+            self.help_interface.load_markdown(url)
+
+    def download_and_install(self, file_name):
+        messages_box = MessageBoxConfirm(self.tr("更新提醒"), self.tr("下载已经完成，是否开始更新"), self.window())
+        if messages_box.exec():
+            source_file = os.path.abspath("./AALC Updater.exe")
+            assert_name = file_name
+            subprocess.Popen([source_file, assert_name], creationflags=subprocess.DETACHED_PROCESS)
+
+    def retranslateUi(self):
+        self.pivot.setItemText("farming_interface", self.tr("一键长草"))
+        self.pivot.setItemText("help_interface", self.tr("帮助"))
+        self.pivot.setItemText("tools_interface", self.tr("小工具"))
+        self.pivot.setItemText("setting_interface", self.tr("设置"))
+
+        if "team_setting" in list(self.pivot.items.keys()):
+            self.pivot.setItemText("team_setting", self.tr("队伍设置"))
+        if hasattr(self, "resource_sync_coordinator"):
+            self.resource_sync_coordinator.refresh_status_text()
+
+    def show_announcement_board(self):
+        def handler_update(status):
+            """
+            公告处理函数，根据不同的公告状态执行不同的操作。
+            :param status: 公告状态。
+            """
+            if status == AnnouncementStatus.ANNO_AVAILABLE:
+                # 当有新公告时，弹出公告栏
+                messages_box = AnnouncementBoard(
+                    self.announcement_thread.announcement,
+                    self.announcement_thread.announcement_time,
+                    self.window(),
+                )
+                messages_box.show()
+                messages_box.setDefault(0)
+
+        try:
+            # 创建一个公告线程实例
+            self.announcement_thread = AnnouncementThread()
+            # 将公告处理函数连接到更新线程的信号
+            self.announcement_thread.AnnouncementSignal.connect(handler_update)
+            # 启动公告线程
+            self.announcement_thread.start()
+        except Exception as e:
+            log.error(f"show_announcement_board 出错：{e}")

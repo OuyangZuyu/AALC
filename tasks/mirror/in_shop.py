@@ -1,0 +1,1639 @@
+from time import sleep
+
+from PIL import Image
+
+from module.automation import auto
+from module.config import TeamSetting, cfg
+from module.logger import log
+from module.ocr import ocr
+from tasks import all_sinners_name, all_sinners_name_zh, all_systems, system_cn_zh
+from tasks.base.back_init_menu import back_init_menu
+from tasks.base.retry import retry
+from tasks.mirror import fusion_result, must_be_abandoned, must_purchase
+from tasks.mirror.priority_purchase import PurchaseResult, buy_specified
+from utils.image_utils import ImageUtils
+from utils.protected_gifts import ProtectedGiftMatcher
+
+
+class FusionAttemptStopped(Exception):
+    pass
+
+
+class Shop:
+    def __init__(self, team_setting: TeamSetting):
+        self.protect_gift_images = team_setting.gift_lock_enabled
+        self.protected_gift_images = tuple(team_setting.gift_lock_images)
+        self.stop_fusion_on_failure = team_setting.stop_fusion_on_failure
+        self._gift_matcher = ProtectedGiftMatcher(self.protected_gift_images)
+        self.specify_gift_images = team_setting.gift_lock_enabled
+        self.specified_gift_images = tuple(team_setting.gift_lock_images)
+        self._specified_matcher = ProtectedGiftMatcher(self.specified_gift_images)
+        self._specified_attempted = set()
+        self._protection_error_logged = False
+        self._fusion_successes = 0
+        self.system = all_systems[team_setting.team_system]  # 队伍体系
+        self.sinner_team = team_setting.sinner_order  # 选择的罪人序列
+        # 获取舍弃的饰品体系列表
+        self.shop_sell_list = []
+        for system in list(all_systems.values()):
+            if system == self.system:
+                continue
+            if getattr(team_setting, f"system_{system}", False):
+                self.shop_sell_list.append(system)
+        self.fuse_switch = False if team_setting.shop_strategy == 0 else True  # 是否启动合成模式
+        self.fuse_aggressive_switch = True if team_setting.shop_strategy == 2 else False  # 是否启动激进合成模式
+        self.do_not_heal = team_setting.do_not_heal  # 是否不治疗
+        self.do_not_buy = team_setting.do_not_buy  # 是否不购买
+        self.do_not_fuse = team_setting.do_not_fuse  # 是否不合成
+        self.do_not_sell = team_setting.do_not_sell  # 是否不出售
+        self.do_not_enhance = team_setting.do_not_enhance  # 是否不升级
+        self.aggressive_save_systems = team_setting.aggressive_save_systems  # 激进合成期间保护本体系饰品
+        self.only_aggressive_fuse = team_setting.only_aggressive_fuse  # 是否只进行激进合成，不进行其他合成
+        self.do_not_system_fuse = team_setting.do_not_system_fuse  # 是否不进行体系饰品合成
+        self.only_system_fuse = team_setting.only_system_fuse  # 是否只进行体系饰品合成
+        # 是否在合成四级后改变行动策略
+        self.after_level_IV = team_setting.after_level_IV
+        self.after_level_IV_select = team_setting.after_level_IV_select
+        # 是否自定义商店购物策略
+        self.shopping_strategy = team_setting.shopping_strategy
+        self.shopping_strategy_select = team_setting.shopping_strategy_select
+        # 是否启用第二体系
+        self.second_system = team_setting.second_system
+        self.second_system_select = all_systems[team_setting.second_system_select]
+        self.second_system_setting = team_setting.second_system_setting
+        self.second_system_action = team_setting.second_system_action
+        # 技能替换
+        self.skill_replacement = team_setting.skill_replacement
+        self.skill_replacement_select = team_setting.skill_replacement_select
+        self.skill_replacement_mode = team_setting.skill_replacement_mode
+        self.max_keyword_refresh = team_setting.max_keyword_refresh
+        self.max_normal_refresh = team_setting.max_normal_refresh
+        self.ignore_shop = team_setting.ignore_shop  # 忽略的商店楼层
+
+        self.aggressive_also_enhance = team_setting.aggressive_also_enhance  # 激进合成期间也升级饰品
+
+        self.fuse_IV = False
+        self.fuse_second_IV = False
+        self.fuse_system_gift_1 = False
+        self.fuse_system_gift_2 = False
+        self.the_first_line_position = None
+        self.replacement = 0
+
+        # 用于记录已升级的ego饰品
+        self.enhance_gifts_list = []
+        self.first_gift_enhance = False
+
+    class RestartGame(Exception):
+        pass
+
+    @property
+    def _image_protection_active(self):
+        return self.protect_gift_images and bool(self.protected_gift_images)
+
+    def _filter_protected_gifts(self, points):
+        if not self._image_protection_active:
+            return points
+        try:
+            allowed = []
+            for point in points:
+                protected = self._gift_matcher.match(auto.screenshot, point)
+                if protected:
+                    log.debug(f"图片保护：跳过合成/出售材料 {protected}")
+                else:
+                    if isinstance(self._gift_matcher.last_scan, dict):
+                        log.debug(f"图片保护未命中（阈值{self._gift_matcher.threshold}）：{self._gift_matcher.last_scan}")
+                    allowed.append(point)
+            return allowed
+        except Exception as error:
+            if not self._protection_error_logged:
+                log.warning(f"保护图片无法读取或匹配，本店不选择合成/出售材料：{error}")
+                self._protection_error_logged = True
+            return []
+
+    def _unprotected_sale(self, target):
+        points = auto.find_element(target, find_type="image_with_multiple_targets") or []
+        if isinstance(points, tuple) and len(points) == 2 and isinstance(points[0], (int, float)):
+            points = [points]
+        points = self._filter_protected_gifts(points)
+        return points[0] if points else None
+
+    def _stop_failed_fusion(self):
+        if self.stop_fusion_on_failure:
+            raise FusionAttemptStopped()
+
+    def _run_fusion_stage(self, operation):
+        if not self.stop_fusion_on_failure:
+            operation()
+            return True
+        before = self._fusion_successes
+        try:
+            operation()
+        except FusionAttemptStopped:
+            log.info("一次合成未果，结束本店合成阶段，继续后续商店步骤")
+            return False
+        if self._fusion_successes == before:
+            log.info("本次未能合成饰品，结束本店合成阶段，继续后续商店步骤")
+            return False
+        return True
+
+    def ego_gift_to_power_up(self):
+        loop_count = 30
+        auto.model = "clam"
+        while True:
+            # 自动截图
+            if auto.take_screenshot() is None:
+                continue
+            auto.mouse_to_blank()
+            if auto.click_element("mirror/shop/power_up_assets.png"):
+                auto.mouse_to_blank()
+                sleep(0.5)
+                if auto.click_element("mirror/shop/power_up_confirm_assets.png", take_screenshot=True) is False:
+                    return True
+                sleep(3)
+                if retry() is False:
+                    raise self.RestartGame()
+            if auto.find_element("mirror/shop/power_up_confirm_assets.png"):
+                return False
+            loop_count -= 1
+            if loop_count < 20:
+                auto.model = "normal"
+            if loop_count < 10:
+                auto.model = "aggressive"
+            if loop_count < 0:
+                log.error("无法升级ego饰品")
+                break
+
+    def _buy_specified_gifts(self):
+        if self.do_not_buy or not self.specify_gift_images or not self.specified_gift_images:
+            return PurchaseResult()
+        return buy_specified(auto, self._specified_matcher, self._specified_attempted, log)
+
+    def buy_gifts(self):
+        def sort_points(points, complete=0, threshold=40):
+            # 第一步：先按 X 坐标排好（左右顺序）
+            points.sort(key=lambda p: p[0])
+            # 第二步：按 Y 坐标“归一化”后排序（上下顺序）
+            points.sort(key=lambda p: p[1] // threshold)
+
+            return points[:-complete] if complete > 0 else points
+
+        def re_sort_points(points):
+            commodity_every_line = 4
+            coins_point = auto.find_element("mirror/shop/shop_coins_assets.png", take_screenshot=True)
+            scale = cfg.set_win_size / 1440
+            if not coins_point or not points:
+                auto.mouse_click_blank(times=3)
+                coins_point = auto.find_element("mirror/shop/shop_coins_assets.png", take_screenshot=True)
+                if not coins_point or not points:
+                    return points
+            step = 300 * scale
+            first_grid_x = coins_point[0] + 150 * scale
+            new_points = []
+            for p in points:
+                orig_x, orig_y = p[0], p[1]
+
+                # 计算当前所在的列索引 (0, 1, 2, 3...)
+                # 注意：这里只用 x 判定列，不需要 round 整个坐标，只需要知道它在哪一列
+                col = round((orig_x - first_grid_x) / step)
+
+                if col > 0:
+                    # --- 情况 A: 还在同行 ---
+                    # y 值绝对不变，x 值减去一个 step
+                    new_x = orig_x - step
+                    new_y = orig_y
+                else:
+                    # --- 情况 B: 跨行移动 (col == 0) ---
+                    # x 值跳到最后一列：增加 (每行个数 - 1) 个 step
+                    # y 值向上移动一个 step
+                    new_x = orig_x + (commodity_every_line - 1) * step
+                    new_y = orig_y - step
+
+                new_points.append([new_x, new_y])
+
+            return new_points
+
+        log.debug("开始执行饰品购买模块")
+        keyword_refresh_count = 0
+        normal_refresh_count = 0
+        complete_count = 0
+        while True:
+            # 自动截图
+            if auto.take_screenshot() is None:
+                continue
+            if self.specify_gift_images and self.specified_gift_images:
+                result = self._buy_specified_gifts()
+                complete_count += result.count
+                if not result.ready:
+                    return
+            if self.shopping_strategy is False or (
+                self.shopping_strategy and self.shopping_strategy_select in (0, 1, 5)
+            ):
+                # 购买必买项（回血饰品）
+                log.debug("开始购买必买项")
+                for commodity in must_purchase:
+                    if auto.click_element(commodity, threshold=0.85):
+                        buy_chance = 10
+                        while auto.click_element("mirror/shop/purchase_assets.png") is False:
+                            while auto.take_screenshot() is None:
+                                continue
+                            if retry() is False:
+                                raise self.RestartGame()
+                            if auto.click_element("mirror/road_in_mir/ego_gift_get_confirm_assets.png"):
+                                complete_count += 1
+                                break
+                            buy_chance -= 1
+                            if buy_chance <= 5:
+                                auto.click_element(commodity, threshold=0.85)
+                            if buy_chance <= 0:
+                                auto.mouse_click_blank(times=3)
+                                break
+                        sleep(1)
+                        auto.click_element(
+                            "mirror/road_in_mir/ego_gift_get_confirm_assets.png",
+                            take_screenshot=True,
+                        )
+                        while auto.take_screenshot() is None:
+                            continue
+
+            if self.fuse_aggressive_switch:
+                log.debug("开始购买强化素材")
+                if self.shopping_strategy is False or (
+                    self.shopping_strategy and self.shopping_strategy_select in (1, 3, 4)
+                ):
+                    if auto.click_element("mirror/shop/level_IV_to_buy.png", threshold=0.82):
+                        sleep(1)
+                        while auto.take_screenshot() is None:
+                            continue
+                        if auto.click_element("mirror/shop/purchase_assets.png"):
+                            sleep(1)
+                            while auto.take_screenshot() is None:
+                                continue
+                            if retry() is False:
+                                raise self.RestartGame()
+                            auto.click_element("mirror/road_in_mir/ego_gift_get_confirm_assets.png")
+                            complete_count += 1
+                            continue
+                        else:
+                            auto.mouse_click_blank()
+
+                    if auto.click_element("mirror/shop/level_III_to_buy.png", threshold=0.82):
+                        sleep(1)
+                        if auto.click_element("mirror/shop/purchase_assets.png", take_screenshot=True):
+                            sleep(1)
+                            if retry() is False:
+                                raise self.RestartGame()
+                            auto.click_element(
+                                "mirror/road_in_mir/ego_gift_get_confirm_assets.png",
+                                take_screenshot=True,
+                            )
+                            complete_count += 1
+                            continue
+                        else:
+                            auto.mouse_click_blank()
+
+            if self.shopping_strategy is False or (
+                self.shopping_strategy and self.shopping_strategy_select in (2, 4, 5)
+            ):
+                log.debug("开始购买本体系饰品")
+                # 购买体系饰品
+                system_gift = auto.find_element(
+                    f"mirror/shop/enhance_gifts/shop_{self.system}.png",
+                    find_type="image_with_multiple_targets",
+                    threshold=0.85,
+                    take_screenshot=True,
+                )
+                system_gift = sort_points(system_gift, complete_count)
+                while system_gift:
+                    gift = system_gift.pop(0)
+                    auto.mouse_action_with_pos((gift[0], gift[1]), offset=True)
+                    sleep(1)
+                    while auto.take_screenshot() is None:
+                        continue
+                    if self.system == "bleed" and not cfg.not_skip_whitegossypium:
+                        if auto.find_language_text("白棉花", ["white", "gossypium"], all_text=True):
+                            auto.mouse_click_blank(times=2)
+                        sleep(1)
+                    if auto.click_element("mirror/shop/purchase_assets.png", take_screenshot=True):
+                        sleep(1)
+                        auto.click_element(
+                            "mirror/road_in_mir/ego_gift_get_confirm_assets.png",
+                            take_screenshot=True,
+                        )
+                        complete_count += 1
+                        system_gift = re_sort_points(system_gift)
+                        auto.mouse_click_blank(times=3)
+                        continue
+                    else:
+                        if auto.click_element("mirror/road_in_mir/ego_gift_get_confirm_assets.png",take_screenshot=True):
+                            sleep(0.5)
+                        auto.mouse_click_blank(times=3)
+                        sleep(1)
+
+            if self.second_system and self.second_system_action[1]:
+                if self.second_system_setting == 1 or (self.second_system_setting == 0 and self.fuse_IV is True):
+                    system_gift = auto.find_element(
+                        f"mirror/shop/enhance_gifts/shop_{self.second_system_select}.png",
+                        find_type="image_with_multiple_targets",
+                        threshold=0.85,
+                    )
+                    system_gift = sort_points(system_gift, complete_count)
+                    while system_gift:
+                        gift = system_gift.pop(0)
+                        auto.mouse_action_with_pos((gift[0], gift[1]), offset=True)
+                        sleep(1)
+                        while auto.take_screenshot() is None:
+                            continue
+                        if self.system == "bleed" and not cfg.not_skip_whitegossypium:
+                            if auto.find_language_text("白棉花", ["white", "gossypium"], all_text=True):
+                                auto.mouse_click_blank(times=2)
+                            sleep(1)
+                        if auto.click_element("mirror/shop/purchase_assets.png", take_screenshot=True):
+                            sleep(1)
+                            auto.click_element(
+                                "mirror/road_in_mir/ego_gift_get_confirm_assets.png",
+                                take_screenshot=True,
+                            )
+                            complete_count += 1
+                            system_gift = re_sort_points(system_gift)
+                            auto.mouse_click_blank(times=3)
+                            continue
+                        else:
+                            if auto.click_element("mirror/road_in_mir/ego_gift_get_confirm_assets.png",take_screenshot=True):
+                                sleep(0.5)
+                            auto.mouse_click_blank(times=3)
+                            sleep(1)
+
+            if retry() is False:
+                raise self.RestartGame()
+
+            my_remaining_money = self._get_cost()
+
+            if my_remaining_money < 0:
+                log.warning("无法读取剩余金钱，跳过本次刷新")
+            elif keyword_refresh_count < self.max_keyword_refresh and my_remaining_money >= 300:
+                auto.mouse_click_blank(times=3)
+                if auto.click_element("mirror/shop/refresh_keyword_assets.png"):
+                    sleep(1)
+                    auto.click_element(
+                        f"mirror/shop/keyword/keyword_{self.system}.png",
+                        take_screenshot=True,
+                    )
+                    sleep(0.5)
+                    auto.click_element("mirror/shop/refresh_keyword_confirm_assets.png")
+                    for _ in range(3):
+                        if auto.find_element(
+                            "mirror/shop/refresh_keyword_confirm_assets.png",
+                            take_screenshot=True,
+                        ):
+                            log.debug("关键词刷新确认未生效，重试中")
+                            sleep(0.5)
+                            auto.click_element(
+                                f"mirror/shop/keyword/keyword_{self.system}.png",
+                                take_screenshot=True,
+                            )
+                            sleep(0.5)
+                            auto.click_element(
+                                "mirror/shop/refresh_keyword_confirm_assets.png",
+                                take_screenshot=True,
+                            )
+                        else:
+                            break
+                    keyword_refresh_count += 1
+                    self._specified_attempted.clear()
+                    auto.mouse_click_blank()
+                    sleep(3)
+                    if retry() is False:
+                        raise self.RestartGame()
+                    if self.skill_replacement and self.replacement < 3:
+                        self.replacement_skill()
+                    continue
+
+            if normal_refresh_count < self.max_normal_refresh and my_remaining_money >= 200:
+                auto.mouse_click_blank(times=3)
+                if auto.click_element("mirror/shop/refresh_assets.png"):
+                    normal_refresh_count += 1
+                    self._specified_attempted.clear()
+                    sleep(3)
+                    if retry() is False:
+                        raise self.RestartGame()
+                    if self.skill_replacement and self.replacement < 3:
+                        self.replacement_skill()
+                    continue
+
+            break
+
+    def fuse_useless_gifts_aggressive(self):
+        """合成无用饰品_激进版"""
+
+        scale = cfg.set_win_size / 1440
+
+        def processing_coordinates(my_gift_list, coordinates, threshold=50):
+            """将需要保护的坐标移除出列表"""
+            for position in my_gift_list:
+                if (
+                    abs(position[0] - coordinates[0]) <= threshold * scale
+                    and abs(position[1] - coordinates[1]) <= threshold * scale
+                ):
+                    my_gift_list.pop(my_gift_list.index(position))
+
+            return my_gift_list
+
+        if auto.find_element(
+            f"mirror/shop/level_IV_gifts/{self.system}_level_IV.png",
+            take_screenshot=True,
+            threshold=0.75,
+        ):
+            self.after_fuse_IV()
+            if self.fuse_aggressive_switch is False:
+                log.info("已有本体系四级饰品，切换到非激进模式")
+                return
+
+        if auto.find_element(
+            f"mirror/shop/level_IV_gifts/{self.second_system_select}_level_IV.png",
+            take_screenshot=True,
+        ):
+            if self.fuse_IV is True:
+                self.fuse_switch = False
+                self.fuse_aggressive_switch = False
+                self.fuse_second_IV = True
+                log.info("已有本体系、第二体系的四级饰品，切换到出售模式")
+                return
+
+        log.debug("开始执行激进合成模块")
+        while True:
+            auto.mouse_to_blank()
+            if auto.take_screenshot() is None:
+                continue
+
+            fuse = False
+            gift_list = []
+
+            points = auto.find_element(
+                "mirror/shop/fuse_label.png", find_type="image_with_multiple_targets", threshold=0.9
+            )
+
+            points.sort(key=lambda c: (c[1], c[0]))
+
+            if len(points) >= 1:
+                gift = points[-1]
+            else:
+                self._stop_failed_fusion()
+                return
+            if gift:
+                first_gift = [gift[0] + 95 * scale, gift[1] + 135 * scale]
+                if self.the_first_line_position is None:
+                    self.the_first_line_position = first_gift[1] + 100 * scale
+                for i in range(10):
+                    gift_list.append(
+                        [
+                            first_gift[0] + 190 * (i % 5) * scale,
+                            first_gift[1] + 190 * (i // 5) * scale,
+                        ]
+                    )
+            else:
+                return
+
+            protect_list = [
+                "mirror/shop/level_IV_gifts/lunar_memory.png",
+                f"mirror/shop/level_IV_gifts/{self.system}_level_IV.png",
+                "mirror/shop/must_be_abandoned/leave2_vestige2.png",
+                "mirror/shop/must_be_abandoned/leave3_vestige.png",
+            ]
+            if self.second_system and self.second_system_action[0]:
+                protect_list.append(f"mirror/shop/level_IV_gifts/{self.second_system_select}_level_IV.png")
+
+            for protect_gift in protect_list:
+                if protect_coordinates := auto.find_element(protect_gift, threshold=0.7):
+                    gift_list = processing_coordinates(gift_list, protect_coordinates)
+
+            if self.aggressive_save_systems:
+                protect_coord = []
+                for coord in gift_list:
+                    system_bbox = [
+                        coord[0],
+                        coord[1],
+                        coord[0] + 100 * scale,
+                        coord[1] + 100 * scale,
+                    ]
+                    if auto.find_element(
+                        f"mirror/shop/enhance_gifts/{self.system}.png",
+                        my_crop=system_bbox,
+                    ):
+                        protect_coord.append(coord)
+                for coord in protect_coord:
+                    gift_list = processing_coordinates(gift_list, coord)
+
+            gift_list = self._filter_protected_gifts(gift_list)
+
+            # 直到合成概率90%
+            for coord in gift_list:
+                auto.mouse_click(coord[0], coord[1])
+                if auto.find_element(
+                    "mirror/shop/fuse_90%_assets.png",
+                    threshold=0.97,
+                    take_screenshot=True,
+                ):
+                    break
+
+            # 如果无法合成四级，或可用饰品不足三个，则退出此次合成
+            if not auto.find_element("mirror/shop/fuse_90%_assets.png", take_screenshot=True):
+                self._stop_failed_fusion()
+                return
+            if not auto.find_element("mirror/shop/fusion_level_IV_gift_assets.png", threshold=0.9):
+                self._stop_failed_fusion()
+                return
+
+            loop_times = 15
+            fuse_use_starlight_chance = 5
+            while True:
+                auto.mouse_to_blank()
+                if auto.take_screenshot() is None:
+                    continue
+
+                if self.stop_fusion_on_failure:
+                    if loop_times <= 0:
+                        self._stop_failed_fusion()
+                    loop_times -= 1
+
+                if ego_gift_get_confirm := auto.find_element("mirror/road_in_mir/ego_gift_get_confirm_assets.png"):
+                    self._fusion_successes += 1
+                    if auto.find_language_text(["残片", "罪孽"], ["fragment", "corrosion", "resources"]):
+                        fuse = True
+                    else:
+                        if auto.find_language_text(system_cn_zh[self.system], self.system):
+                            self.after_fuse_IV()
+                            fuse = False
+                    auto.mouse_click(ego_gift_get_confirm[0], ego_gift_get_confirm[1])
+                    sleep(0.5)
+                    auto.click_element(
+                        "mirror/road_in_mir/ego_gift_get_confirm_assets.png",
+                        take_screenshot=True,
+                    )
+                    break
+
+                if fuse_use_starlight_chance > 0 and auto.click_element("mirror/shop/fuse_use_starlight_assets.png"):
+                    fuse_use_starlight_chance -= 1
+                    auto.click_element(
+                        "mirror/shop/fuse_use_starlight_confirm_assets.png",
+                        model="normal",
+                        take_screenshot=True,
+                    )
+                    continue
+
+                if auto.click_element(
+                    "mirror/shop/enhance_and_fuse_and_sell_confirm_assets.png",
+                    model="normal",
+                ):
+                    sleep(2)
+                    if not self.stop_fusion_on_failure:
+                        if loop_times <= 0:
+                            break
+                        loop_times -= 1
+                    continue
+
+                if retry() is False:
+                    raise self.RestartGame()
+
+            if fuse:
+                sleep(2)
+                auto.click_element("mirror/shop/fuse_ego_gift_assets.png", take_screenshot=True)
+                continue
+
+            break
+
+        if retry() is False:
+            raise self.RestartGame()
+
+    def fuse_useless_gifts(self):
+        """合成无用饰品"""
+        scale = cfg.set_win_size / 1440
+
+        def protect_coordinates(my_gift_list, coordinates, threshold=50):
+            """将需要保护的坐标移除出列表"""
+            for position in my_gift_list:
+                if (
+                    abs(position[0] - 50 - coordinates[0]) <= threshold * scale
+                    and abs(position[1] - 50 - coordinates[1]) <= threshold * scale
+                ):
+                    my_gift_list.pop(my_gift_list.index(position))
+
+            return my_gift_list
+
+        def processing_coordinates(my_gift_list):
+            """将列表从左上到右下排序，然后去重"""
+
+            # 排序
+            sorted_list = sorted(my_gift_list, key=lambda x: (x[1], x[0]))
+
+            # 去除重复坐标
+            unique_list = []
+            for coord in sorted_list:
+                if not any(
+                    abs(coord[0] - x[0]) <= 40 * scale and abs(coord[1] - x[1]) <= 40 * scale for x in unique_list
+                ):
+                    unique_list.append(coord)
+
+            # 如果激活激进模式，则过滤第一行的饰品
+            if self.fuse_aggressive_switch:
+                unique_list = [items for items in unique_list if items[1] >= self.the_first_line_position]
+
+            return unique_list
+
+        log.debug("开始执行普通合成模块")
+        block = True
+        while True:
+            auto.mouse_to_blank()
+            if auto.take_screenshot() is None:
+                continue
+
+            fuse = False
+            select_gifts = False
+            gift_list = []
+
+            # 获取无用饰品列表
+            for commodity in must_be_abandoned:
+                item = auto.find_element(commodity, find_type="image_with_multiple_targets")
+                if "white_gossypium" in commodity and "bleed" in self.shop_sell_list:
+                    continue
+                if item:
+                    if isinstance(item, list):
+                        gift_list.extend(list(g) for g in item)
+                    elif isinstance(item, tuple):
+                        gift_list.append(item)
+            for sell_system in self.shop_sell_list:
+                my_sell_system = f"mirror/shop/enhance_gifts/{sell_system}.png"
+                gift = auto.find_element(my_sell_system, find_type="image_with_multiple_targets")
+                if gift:
+                    if isinstance(gift, list):
+                        log.debug(f"识别到{len(gift)}个{sell_system}饰品")
+                        gift_list.extend(list(g) for g in gift)
+                    elif isinstance(gift, tuple):
+                        log.debug(f"识别到1个{sell_system}饰品")
+                        gift_list.append(gift)
+            # 对饰品位置列表进行排序、去重处理
+            my_list = processing_coordinates(gift_list)
+
+            if self.second_system and self.second_system_action[0]:
+                if protect_gift := auto.find_element(
+                    f"mirror/shop/level_IV_gifts/{self.second_system_select}_level_IV.png"
+                ):
+                    my_list = protect_coordinates(my_list, protect_gift)
+
+            my_list = self._filter_protected_gifts(my_list)
+
+            # 选择3样无用饰品，不足则退出合成
+            if len(my_list) <= 2:
+                if block is False:
+                    msg = "饰品舍弃列表数量不足，结束合成"
+                    log.debug(msg)
+                    self._stop_failed_fusion()
+                    return
+            else:
+                for sequence in range(3):
+                    try:
+                        gift_position = my_list[sequence]
+                        auto.mouse_click(gift_position[0], gift_position[1])
+                        sleep(0.75)
+                    except IndexError:
+                        msg = f"饰品舍弃列表已经没有第{sequence + 1}项了"
+                        log.debug(msg)
+                select_gifts = True
+
+            if select_gifts:
+                loop_times = 15
+                fuse_IV = False
+                while True:
+                    auto.mouse_to_blank()
+                    if auto.take_screenshot() is None:
+                        continue
+
+                    if loop_times < 0:
+                        self._stop_failed_fusion()
+                        break
+                    loop_times -= 1
+
+                    if auto.find_element(
+                        "mirror/shop/fusion_level_IV_gift_assets.png", threshold=0.9
+                    ) and auto.find_element("mirror/shop/fuse_90%_assets.png"):
+                        fuse_IV = True
+
+                    if auto.find_element("mirror/road_in_mir/ego_gift_get_confirm_assets.png"):
+                        self._fusion_successes += 1
+                        if fuse_IV:
+                            if auto.find_language_text(["残片", "罪孽"], ["fragment", "corrosion", "resources"]):
+                                pass
+                            else:
+                                if auto.find_language_text(system_cn_zh[self.system], self.system):
+                                    self.fuse_IV = True
+                                    self.fuse_aggressive_switch = False
+                                    log.info("合成四级，切换到非激进模式")
+                            fuse = True
+                            auto.click_element("mirror/road_in_mir/ego_gift_get_confirm_assets.png")
+                            sleep(1)
+                            auto.click_element(
+                                "mirror/road_in_mir/ego_gift_get_confirm_assets.png",
+                                take_screenshot=True,
+                            )
+                            break
+                        else:
+                            if auto.click_element("mirror/road_in_mir/ego_gift_get_confirm_assets.png"):
+                                fuse = True
+                                sleep(1)
+                                auto.click_element(
+                                    "mirror/road_in_mir/ego_gift_get_confirm_assets.png",
+                                    take_screenshot=True,
+                                )
+                                break
+
+                    if auto.click_element(
+                        "mirror/shop/enhance_and_fuse_and_sell_confirm_assets.png",
+                        model="normal",
+                    ):
+                        continue
+
+                    if auto.click_element("mirror/shop/fuse_ego_gift_assets.png"):
+                        continue
+
+                    if retry() is False:
+                        raise self.RestartGame()
+
+            if fuse:
+                auto.click_element("mirror/shop/fuse_ego_gift_assets.png", take_screenshot=True)
+                continue
+
+            while auto.take_screenshot() is None:
+                continue
+            list_block = auto.find_element("mirror/shop/gifts_list_block.png")
+            if list_block is not None and block:
+                block = False
+                auto.mouse_drag(list_block[0], list_block[1], drag_time=1, dy=500)
+                continue
+
+            auto.mouse_click_blank(times=3)
+            self._stop_failed_fusion()
+            break
+
+        if retry() is False:
+            raise self.RestartGame()
+
+    def fuse_system_gifts(self):
+        """合成体系饰品"""
+        if self._image_protection_active:
+            log.info("图片保护已开启：跳过无法逐件过滤自动材料的配方快捷合成")
+            return
+        auto.model = "clam"
+        log.debug("开始执行体系饰品合成模块")
+
+        # 获取合成结果
+        system_gifts = []
+        for gift in fusion_result:
+            gift_name = gift.split("/")[-1]
+            g = gift_name.split("_")
+            if g[0] == self.system:
+                system_gifts.append(gift)
+
+        if self.enter_fuse() is False:
+            self._stop_failed_fusion()
+            return
+
+        while True:
+            if list_block := auto.find_element("mirror/shop/gifts_list_block.png", take_screenshot=True):
+                auto.mouse_drag(list_block[0], list_block[1], drag_time=1, dy=-500)
+            points = auto.find_element(
+                "mirror/shop/fuse_label.png",
+                find_type="image_with_multiple_targets",
+                threshold=0.85,
+                take_screenshot=True,
+            )
+            if len(points) < 2:
+                auto.mouse_click_blank(times=3)
+                self._stop_failed_fusion()
+                return
+
+            points.sort(key=lambda c: (c[1], c[0]))
+
+            dividing_line = points[-1][1]
+
+            fusion = False
+            fusion_gift = None
+            # 如果找到能合成的公式饰品，则合成
+            for gift in system_gifts:
+                if pos := auto.find_element(gift):
+                    if pos[1] > dividing_line:
+                        continue
+                    auto.mouse_click(pos[0], pos[1])
+                    fusion = True
+                    fusion_gift = gift.split("_")[-1]
+                    break
+
+            fusion_pos = []
+            if not fusion:
+                all_system_gift = auto.find_element(
+                    f"mirror/shop/enhance_gifts/{self.system}.png",
+                    find_type="image_with_multiple_targets",
+                    take_screenshot=True,
+                )
+                if len(all_system_gift) > 0:
+                    for g in all_system_gift:
+                        if g[1] < dividing_line:
+                            fusion_pos.append(g)
+                if len(fusion_pos) == 0:
+                    auto.mouse_click_blank(times=3)
+                    self._stop_failed_fusion()
+                    return
+                else:
+                    fusion = True
+
+            if len(fusion_pos) > 0 and fusion_gift is None:
+                pos = fusion_pos.pop(0)
+                auto.mouse_click(pos[0], pos[1])
+
+            chance = 5
+            while fusion:
+                if auto.take_screenshot() is None:
+                    continue
+
+                if chance < 0:
+                    self._stop_failed_fusion()
+                    if len(fusion_pos) > 0:
+                        pos = fusion_pos.pop(0)
+                        auto.mouse_click(pos[0], pos[1])
+                        chance = 5
+                    else:
+                        auto.mouse_click_blank(times=3)
+                        return
+                else:
+                    retry()
+                    chance -= 1
+
+                auto.mouse_to_blank()
+
+                if auto.click_element("mirror/road_in_mir/ego_gift_get_confirm_assets.png"):
+                    self._fusion_successes += 1
+                    break
+
+                if auto.click_element(
+                    "mirror/shop/enhance_and_fuse_and_sell_confirm_assets.png",
+                    model="normal",
+                ):
+                    continue
+
+                if retry() is False:
+                    raise self.RestartGame()
+
+            if fusion:
+                msg = f"成功合成{self.system}体系的公式饰品{fusion_gift if fusion_gift else ''}"
+                log.debug(msg)
+
+    def sell_gifts(self):
+        scale = cfg.set_win_size / 1440
+
+        def protect_coordinates(my_gift, coordinates, threshold=50):
+            """将需要保护的坐标移除出列表"""
+            if (
+                abs(my_gift[0] - coordinates[0]) <= threshold * scale
+                and abs(my_gift[1] - coordinates[1]) <= threshold * scale
+            ):
+                return True
+
+            return False
+
+        list_block = False
+        system_sell = True
+        sell_chance = 20
+        second = None
+        log.debug("开始执行饰品出售模块")
+        while True:
+            # 自动截图
+            if auto.take_screenshot() is None:
+                continue
+
+            gift_sell = False
+
+            if retry() is False:
+                raise self.RestartGame()
+
+            if self.second_system and self.second_system_action[0] and second is None:
+                if protect_gift := auto.find_element(
+                    f"mirror/shop/level_IV_gifts/{self.second_system_select}_level_IV.png"
+                ):
+                    second = protect_gift
+
+            if auto.click_element("mirror/shop/sell_gift_assets.png"):
+                continue
+
+            if auto.click_element("mirror/shop/sell_gift_confirm_assets.png"):
+                sleep(1)
+                continue
+
+            if system_sell:
+                for sell_system in self.shop_sell_list:
+                    my_sell_system = f"mirror/shop/enhance_gifts/{sell_system}.png"
+                    sell_gift = (self._unprotected_sale(my_sell_system) if self._image_protection_active
+                                 else auto.find_element(my_sell_system))
+                    if sell_gift:
+                        if second is not None and protect_coordinates(sell_gift, second):
+                            continue
+                        else:
+                            auto.mouse_click(sell_gift[0], sell_gift[1])
+                            sleep(cfg.mouse_action_interval)
+                        auto.click_element(
+                            "mirror/shop/enhance_and_fuse_and_sell_confirm_assets.png",
+                            model="normal",
+                        )
+                        sleep(1)
+                        if retry() is False:
+                            raise self.RestartGame()
+                        gift_sell = True
+                        sell_chance -= 1
+                        break
+
+            if gift_sell:
+                if sell_chance < 0:
+                    return
+                continue
+
+            if list_block is False and auto.find_element("mirror/shop/gifts_list_block.png"):
+                block_position = auto.find_element("mirror/shop/gifts_list_block.png")
+                auto.mouse_drag(block_position[0], block_position[1], drag_time=1, dy=500)
+                list_block = True
+                second = None
+                continue
+
+            system_sell = False
+
+            for commodity in must_be_abandoned:
+                if self._image_protection_active:
+                    point = self._unprotected_sale(commodity)
+                    selected = bool(point)
+                    if point:
+                        auto.mouse_click(*point)
+                else:
+                    selected = auto.click_element(commodity)
+                if selected:
+                    auto.click_element(
+                        "mirror/shop/enhance_and_fuse_and_sell_confirm_assets.png",
+                        model="normal",
+                    )
+                    sleep(1)
+                    gift_sell = True
+                    break
+
+            if gift_sell:
+                continue
+
+            auto.mouse_click_blank(times=3)
+            sleep(1)
+            break
+
+    def enter_fuse(self):
+        loop_count = 15
+        auto.model = "clam"
+        auto.mouse_to_blank()
+        log.debug("开始执行饰品合成前置模块")
+        while True:
+            if auto.take_screenshot() is None:
+                continue
+
+            if (
+                self.fuse_IV is True
+                and self.second_system is True
+                and self.fuse_second_IV is False
+                and self.second_system_action[0] is True
+                and self.fuse_aggressive_switch is True
+            ):
+                if auto.click_element(f"mirror/shop/keyword/keyword_{self.second_system_select}.png"):
+                    while auto.take_screenshot() is None:
+                        continue
+                    if auto.click_element("mirror/shop/fuse_gift_confirm_assets.png", model="normal"):
+                        sleep(0.5)
+                        break
+            else:
+                if auto.click_element(f"mirror/shop/keyword/keyword_{self.system}.png"):
+                    while auto.take_screenshot() is None:
+                        continue
+                    if auto.click_element("mirror/shop/fuse_gift_confirm_assets.png", model="normal"):
+                        sleep(0.5)
+                        break
+            if auto.click_element("mirror/shop/fuse_to_select_keyword_assets.png"):
+                continue
+
+            loop_count -= 1
+            if loop_count < 10:
+                auto.model = "normal"
+            if loop_count < 5:
+                auto.model = "aggressive"
+            if loop_count < 0:
+                log.error("无法合成ego饰品")
+                return False
+
+            # 进入合成页面
+            if auto.click_element("mirror/shop/fuse_gift_assets.png"):
+                continue
+
+        return True
+
+    def fuse_gift(self):
+        # 激进合成
+        if self.fuse_aggressive_switch and not self.only_system_fuse:
+            log.debug("开始执行第一次激进合成")
+            if self.enter_fuse() is False:
+                return False
+            if not self._run_fusion_stage(self.fuse_useless_gifts_aggressive):
+                return
+            auto.mouse_click_blank(times=3)
+        if self.fuse_switch is False:
+            if self.fuse_IV is True and self.after_level_IV is True and self.after_level_IV_select == 3:
+                log.debug("合成四级后跳过商店，执行最后一次升级饰品")
+                self.enhance_gifts()
+            return
+        # 普通合成
+        if self.only_aggressive_fuse or self.only_system_fuse:
+            pass
+        else:
+            log.debug("开始执行普通合成")
+            if self.enter_fuse() is False:
+                return False
+            if not self._run_fusion_stage(self.fuse_useless_gifts):
+                return
+            auto.mouse_click_blank(times=3)
+
+        # 再次激进合成
+        if self.fuse_aggressive_switch and self.fuse_IV is not True and not self.only_system_fuse:
+            log.debug("开始执行第二次激进合成")
+            if self.enter_fuse() is False:
+                return False
+            if not self._run_fusion_stage(self.fuse_useless_gifts_aggressive):
+                return
+            auto.mouse_click_blank(times=3)
+        if self.fuse_switch is False:
+            if self.fuse_IV is True and self.after_level_IV is True and self.after_level_IV_select == 3:
+                log.debug("合成四级后跳过商店，执行最后一次升级饰品")
+                self.enhance_gifts()
+            return
+        # 合成体系饰品
+        if not self.only_aggressive_fuse and not self.do_not_system_fuse:
+            if not self._run_fusion_stage(self.fuse_system_gifts):
+                return
+            auto.mouse_click_blank(times=3)
+
+    def heal_sinner(self):
+        # 全体治疗
+        loop_count = 10
+        auto.model = "clam"
+        log.debug("开始执行罪人治疗模块")
+        sinner_be_heal = False
+        while True:
+            # 自动截图
+            if auto.take_screenshot() is None:
+                continue
+
+            loop_count -= 1
+            if loop_count < 5:
+                auto.model = "normal"
+            if loop_count < 2:
+                auto.model = "aggressive"
+            if loop_count < 0:
+                log.error("治疗罪人失败")
+                break
+
+            if sinner_be_heal is True and auto.click_element("mirror/shop/heal_sinner/heal_sinner_return_assets.png"):
+                if auto.find_element("mirror/shop/shop_coins_assets.png", take_screenshot=True):
+                    break
+                elif auto.find_element("mirror/shop/heal_sinner/heal_sinner_return_assets.png"):
+                    continue
+                elif auto.find_element("mirror/shop/heal_sinner/heal_sinner_return_assets.png"):
+                    continue
+
+            if auto.click_element("mirror/shop/heal_sinner/heal_all_sinner_assets.png"):
+                sinner_be_heal = True
+                continue
+
+            if loop_count < 5:
+                money = self._get_cost(in_heal=True)
+                if money < 0:
+                    log.warning("无法读取剩余金钱，跳过治疗")
+                    continue
+                if money < 100:
+                    log.debug("金币不足，无法治疗罪人")
+                    break
+
+            if auto.click_element("mirror/shop/heal_sinner/heal_sinner_assets.png"):
+                continue
+
+            if retry() is False:
+                raise self.RestartGame()
+
+    def enhance_gifts(self):
+        _ENHANCE_SCAN_REGION_REL = {
+            "left": 0.5151,
+            "top": 0.3380,
+            "right": 0.8844,
+            "bottom": 0.7130,
+        }
+
+        def _filter_enhance_gift_scan_points(points, screen_size):
+            if not points or not screen_size:
+                return points
+
+            width, height = screen_size
+            if not width or not height:
+                return points
+
+            left = int(round(_ENHANCE_SCAN_REGION_REL["left"] * width))
+            top = int(round(_ENHANCE_SCAN_REGION_REL["top"] * height))
+            right = int(round(_ENHANCE_SCAN_REGION_REL["right"] * width))
+            bottom = int(round(_ENHANCE_SCAN_REGION_REL["bottom"] * height))
+
+            return [
+                point
+                for point in points
+                if left <= int(point[0]) <= right and top <= int(point[1]) <= bottom
+            ]
+
+        def check_enhanced(pos):
+            for p in self.enhance_gifts_list:
+                if abs(pos[0] - p[0]) <= 10 and abs(pos[1] - p[1]) <= 10:
+                    return True
+            return False
+
+        log.debug("开始执行饰品升级模块")
+
+        my_scale = cfg.set_win_size / 1440
+        loop_try_count = 10
+        while True:
+            # 自动截图
+            if auto.take_screenshot() is None:
+                continue
+            if button := auto.find_element("mirror/shop/sort_button_assets.png"):
+                auto.mouse_click(button[0], button[1])
+                auto.mouse_click(button[0], button[1] + 200 * my_scale)
+                break
+            if auto.click_element("mirror/shop/enhance_gifts_assets.png"):
+                sleep(1)
+                continue
+            auto.mouse_click_blank()
+            loop_try_count -= 1
+            if loop_try_count < 0:  # issue 171
+                if retry() is False:
+                    raise self.RestartGame()
+                return False
+
+            if loop_try_count < -50:
+                log.error("不应该发生这样的问题，请提交issue")
+                return False
+
+        loop_count = 30
+        auto.model = "clam"
+        system_level_IV = False
+        second_system_level_IV = False
+        stale_count = 0
+        while True:
+            # 自动截图
+            if auto.take_screenshot() is None:
+                continue
+
+            next_gift = True
+
+            # 升级本体系四级
+            if not system_level_IV:
+                if level_IV := auto.find_element(f"mirror/shop/level_IV_gifts/{self.system}_level_IV.png"):
+                    if check_enhanced(level_IV) is False:
+                        auto.mouse_click(level_IV[0], level_IV[1])
+                        if self.ego_gift_to_power_up() is False:
+                            break
+                        else:
+                            self.enhance_gifts_list.append(level_IV)
+                    system_level_IV = True
+                    continue
+
+            # 升级第二体系四级
+            if self.second_system and self.second_system_action[3] and second_system_level_IV is False:
+                if self.second_system_setting == 1 or (self.second_system_setting == 0 and self.fuse_IV is True):
+                    if level_IV_2 := auto.find_element(
+                        f"mirror/shop/level_IV_gifts/{self.second_system_select}_level_IV.png"
+                    ):
+                        if check_enhanced(level_IV_2) is False:
+                            auto.mouse_click(level_IV_2[0], level_IV_2[1])
+                            if self.ego_gift_to_power_up() is False:
+                                break
+                            else:
+                                self.enhance_gifts_list.append(level_IV_2)
+                        second_system_level_IV = True
+                        continue
+
+            if self.first_gift_enhance is False and system_level_IV is False:
+                if f_gift := auto.find_element(f"mirror/shop/enhance_gifts/big_{self.system}.png"):
+                    if self.ego_gift_to_power_up() is False:
+                        break
+                    else:
+                        self.enhance_gifts_list.append(f_gift)
+                        self.first_gift_enhance = True
+                        continue
+
+            if gifts := auto.find_element(
+                f"mirror/shop/enhance_gifts/{self.system}.png",
+                find_type="image_with_multiple_targets",
+            ):
+                gifts = sorted(gifts, key=lambda x: (x[1], x[0]))
+                raw_count = len(gifts)
+                screen_size = auto.screenshot.size if auto.screenshot is not None else None
+                gifts = _filter_enhance_gift_scan_points(gifts, screen_size)
+                if len(gifts) != raw_count:
+                    log.debug(f"升级扫描区域过滤：{raw_count} -> {len(gifts)}")
+                for gift in gifts:
+                    if check_enhanced(gift) is False:
+                        auto.mouse_click(gift[0], gift[1])
+                        if self.ego_gift_to_power_up() is False:
+                            next_gift = False
+                            break
+                        else:
+                            self.enhance_gifts_list.append(gift)
+                    else:
+                        continue
+                    next_gift = False
+
+            # if list_block is False and auto.find_element("mirror/shop/gifts_list_block.png"):
+            #     block_position = auto.find_element("mirror/shop/gifts_list_block.png")
+            #     auto.mouse_drag(block_position[0], block_position[1], drag_time=1, dy=500)
+            #     list_block = True
+            #     continue
+
+            if next_gift is False:
+                break
+
+            stale_count += 1
+            if stale_count > 2:
+                log.debug("连续多轮未找到可升级饰品，退出升级模块")
+                break
+
+            loop_count -= 1
+            if loop_count < 20:
+                auto.model = "normal"
+            if loop_count < 10:
+                auto.model = "aggressive"
+            if loop_count < 0:
+                log.error("升级ego饰品失败")
+                break
+
+        if retry() is False:
+            raise self.RestartGame()
+
+    def after_fuse_IV(self):
+        self.fuse_IV = True
+        if self.after_level_IV:
+            if self.after_level_IV_select == 0:
+                self.fuse_switch = False
+                self.fuse_aggressive_switch = False
+                log.info("合成四级，切换到出售模式")
+            elif self.after_level_IV_select == 1:
+                self.fuse_aggressive_switch = False
+                log.info("合成四级，切换到非激进模式")
+            elif (
+                self.after_level_IV_select == 2
+                and self.second_system is True
+                and self.fuse_second_IV is False
+                and self.second_system_action[0] is True
+            ):
+                self.fuse_aggressive_switch = True
+                log.debug("合成四级，切换到第二体系四级合成")
+            elif self.after_level_IV_select == 3:
+                log.info("合成四级，跳过之后商店")
+                for i in range(5):
+                    self.ignore_shop[i] = True
+            else:
+                self.fuse_switch = False
+                self.fuse_aggressive_switch = False
+                log.info("合成四级但设置出错，切换到出售模式")
+            return
+        self.fuse_aggressive_switch = False
+        log.info("合成四级，切换到非激进模式")
+
+    def _replace_selected_skill(self):
+        """按配置顺序尝试技能替换；每次重新识别，避免购买后点击旧坐标。"""
+        modes = {3: (1, 0), 4: (0, 1)}.get(self.skill_replacement_mode, (self.skill_replacement_mode,))
+        for mode in modes:
+            if mode not in (0, 1, 2):
+                return
+            coins = auto.find_element(
+                "mirror/shop/skill_replacement_coins.png",
+                find_type="image_with_multiple_targets",
+                take_screenshot=True,
+            )
+            # 购买成功关闭界面或识别不完整时停止，不猜测选项位置。
+            if not coins or len(coins) != 3:
+                return
+            coins = sorted(coins, key=lambda x: x[0])
+            select_mode = 2 - mode
+            auto.mouse_click(coins[select_mode][0], coins[select_mode][1])
+            sleep(0.5)
+            auto.click_element("mirror/shop/skill_replacement_confirm_assets.png")
+            auto.click_element("mirror/shop/skill_replacement_confirm_assets.png")
+            if retry() is False:
+                raise self.RestartGame()
+            sleep(0.5)
+
+    def id_skill_replacement(self, image_path):
+        """
+        处理普通技能替换选项。识别指定模块位置的技能替换区域，
+        根据当前语言和队伍配置构建优先罪人列表，若匹配则执行替换点击流程。
+
+        参数:
+            image_path (str): 代表该技能替换模块的图片路径。
+        """
+        if module_position := auto.find_element(image_path):
+            my_scale = cfg.set_win_size / 1440
+            bbox = (
+                module_position[0] - 150 * my_scale,
+                module_position[1] + 20 * my_scale,
+                module_position[0] + 150 * my_scale,
+                module_position[1] + 100 * my_scale,
+            )
+            sinner_nums = {0: 1, 1: 3, 2: 7}.get(self.skill_replacement_select, 12)
+            sinner_en = [
+                all_sinners_name[self.sinner_team.index(i + 1)]
+                for i in range(sinner_nums)
+                if (i + 1) in self.sinner_team
+            ]
+            sinner_zh = [
+                all_sinners_name_zh[self.sinner_team.index(i + 1)]
+                for i in range(sinner_nums)
+                if (i + 1) in self.sinner_team
+            ]
+            if auto.find_language_text(sinner_zh, sinner_en, my_crop=bbox):
+                auto.mouse_click(module_position[0], module_position[1] - 100 * my_scale)
+                sleep(0.5)
+                self._replace_selected_skill()
+
+    def selected_id_skill_replacement(self, image_path):
+        """
+        处理超级商店中的 "ID 技能替换" 功能。
+        点击"ID 技能搜索"按钮进入已选中角色选项界面，
+        遍历优先罪人列表尝试替换操作。若当前罪人无技能可替换则跳过并尝试下一个。
+
+        参数:
+            image_path (str): 代表该技能替换模块的图片路径。
+        """
+        my_scale = cfg.set_win_size / 1440
+        sinner_x = [
+            x * my_scale
+            for x in [
+                198,
+                353,
+                510,
+                663,
+                818,
+                968,
+                1121,
+                1277,
+                1428,
+                1581,
+                1737,
+                1889,
+            ]
+        ]  # 人格图像位置硬编码
+        sinner_y = 1299 * my_scale
+        sinner_nums = {0: 1, 1: 3, 2: 7}.get(self.skill_replacement_select, 12)
+        sinner_indices = [i for i in range(sinner_nums) if (i + 1) in self.sinner_team]
+        for i in sinner_indices:
+            if auto.find_element("mirror/shop/ID_skill_replace_0_purchased_assets.png"):
+                return
+            auto.click_element(image_path)
+            sleep(0.5)
+            auto.mouse_click(sinner_x[i], sinner_y)
+            sleep(0.5)
+            self._replace_selected_skill()
+        # 如果所有优先罪人都没有技能可替换，则点击返回按钮退出该界面
+        auto.click_element("mirror/shop/ID_skill_replace_search_return_assets.png")
+
+    def replacement_skill(self):
+        """
+        技能替换主流程管理方法。
+        会依据当前身处的商店类型（普通商店 or 超级商店）决定执行的替换逻辑：
+        如果是超级商店，则依次对两个普通替换选项以及已选中角色技能搜索选项（如果存在）执行替换操作；
+        如果是普通商店，则对唯一的技能替换选项执行操作。
+        """
+        msg = "执行商店技能替换任务"
+        log.debug(msg)
+        self.replacement = 0
+        # 检查是否在超级商店
+        is_super_shop = auto.find_element("mirror/shop/super_shop_assets.png")
+        if is_super_shop:
+            log.debug("超级商店")
+
+            # 1. 超级商店存在两个普通技能替换
+            if not auto.find_element("mirror/shop/ID_skill_replace_1_purchased_assets.png"):
+                self.id_skill_replacement("mirror/shop/super_shop_skill_replacement_1_assets.png")
+            else:
+                self.replacement += 1
+            if not auto.find_element("mirror/shop/ID_skill_replace_2_purchased_assets.png"):
+                self.id_skill_replacement("mirror/shop/super_shop_skill_replacement_2_assets.png")
+            else:
+                self.replacement += 1
+
+            if not auto.find_element("mirror/shop/ID_skill_replace_0_purchased_assets.png"):
+                self.selected_id_skill_replacement("mirror/shop/ID_skill_search_assets.png")
+            else:
+                self.replacement += 1
+
+        # 普通商店流程
+        else:
+            log.debug("普通商店")
+            if not auto.find_element("mirror/shop/ID_skill_replace_0_purchased_assets.png"):
+                self.id_skill_replacement("mirror/shop/skill_replacement_assets.png")
+            else:
+                self.replacement = 3
+
+    # 在商店的处理
+    def in_shop(self, layer):
+        self._specified_attempted.clear()
+        self._fusion_successes = 0
+        self._protection_error_logged = False
+        heal = False
+        sell = False
+        buy = False
+        fuse = False
+        enhance = False
+        skill = False
+        try:
+            while True:
+                # 忽略楼层商店的情况
+                if 1 <= layer <= 5 and self.ignore_shop[layer - 1]:
+                    msg = f"第{layer}楼层商店被忽略"
+                    log.info(msg)
+                    break
+
+                # 自动截图
+                if auto.take_screenshot() is None:
+                    continue
+
+                auto.mouse_click_blank(times=3)
+                auto.click_element("mirror/shop/return_assets.png")
+                sleep(1)
+
+                if self.skill_replacement and skill is False:
+                    self.replacement_skill()
+                    skill = True
+                    continue
+
+                if heal is False:
+                    if self.do_not_heal:
+                        heal = True
+                    else:
+                        self.heal_sinner()
+                        heal = True
+                        continue
+
+                if sell is False:
+                    if self.do_not_sell:
+                        sell = True
+                    else:
+                        # 出售无用饰品
+                        if self.fuse_switch is False:
+                            self.sell_gifts()
+                        sell = True
+                        continue
+
+                if buy is False:
+                    if self.do_not_buy:
+                        buy = True
+                    else:
+                        self.buy_gifts()
+                        buy = True
+                        continue
+
+                if fuse is False:
+                    if self.do_not_fuse:
+                        fuse = True
+                    else:
+                        # 合成饰品
+                        if self.fuse_switch:
+                            self.fuse_gift()
+                        fuse = True
+                        continue
+
+                if enhance is False:
+                    if self.do_not_enhance:
+                        enhance = True
+                    elif self.fuse_aggressive_switch and self.aggressive_also_enhance is False:
+                        enhance = True
+                    else:
+                        # 升级体系ego饰品
+                        self.enhance_gifts()
+                        enhance = True
+                        continue
+
+                break
+
+            auto.mouse_click_blank(times=3)
+
+            loop_count = 30
+            auto.model = "clam"
+            while True:
+                # 自动截图
+                if auto.take_screenshot() is None:
+                    continue
+
+                if retry() is False:
+                    raise self.RestartGame()
+                if auto.find_element("mirror/road_in_mir/legend_assets.png"):
+                    break
+                if auto.click_element("mirror/shop/leave_shop_confirm_assets.png"):
+                    continue
+                if auto.click_element("mirror/shop/leave_assets.png"):
+                    sleep(1)
+                    continue
+                if auto.click_element("mirror/shop/heal_sinner/heal_sinner_return_assets.png"):
+                    continue
+                loop_count -= 1
+                if loop_count < 20:
+                    auto.model = "normal"
+                if loop_count < 10:
+                    auto.model = "aggressive"
+                    auto.mouse_click_blank(times=3)
+                if loop_count < 0:
+                    log.error("无法退出商店,尝试回到初始界面")
+                    back_init_menu()
+                    break
+        except self.RestartGame:
+            log.error("执行商店操作期间出现错误，尝试重启游戏")
+            return
+
+    def _get_cost(self, in_heal=False) -> int:
+        _MONEY_OCR_TRANSLATION = str.maketrans(
+            {
+                "O": "0",
+                "o": "0",
+                "D": "0",
+                "Q": "0",
+                "I": "1",
+                "l": "1",
+                "Z": "2",
+                "S": "5",
+                "G": "6",
+                "B": "8",
+                "h": "4",
+            }
+        )
+
+        def _extract_money_from_ocr_texts(texts):
+            if not texts:
+                return None
+
+            cleaned_texts = [text.strip().replace(" ", "").replace(",", "") for text in texts if text]
+            for text in cleaned_texts:
+                if text.isdigit():
+                    return int(text)
+
+            for text in cleaned_texts:
+                normalized = text.translate(_MONEY_OCR_TRANSLATION)
+                if normalized.isdigit():
+                    return int(normalized)
+
+            return None
+
+        def _retry_money_ocr_with_scaled_crop(money_bbox, scale=2):
+            if auto.screenshot is None or money_bbox is None:
+                return []
+
+            try:
+                crop = auto.screenshot.crop(money_bbox)
+                width, height = crop.size
+                try:
+                    resampling = Image.Resampling.BICUBIC
+                except AttributeError:
+                    resampling = Image.BICUBIC
+                enlarged = crop.resize((width * scale, height * scale), resample=resampling)
+                result = ocr.run(enlarged)
+                return list(result.txts or [])
+            except Exception:
+                log.debug("OCR 放大裁剪识别失败", exc_info=True)
+                return []
+
+        """获取当前剩余的经费"""
+        my_remaining_money = -1
+        money_bbox = None
+        my_money = None
+        try:
+            if in_heal:
+                money_bbox = ImageUtils.get_bbox(ImageUtils.load_image("mirror/shop/my_money_heal_bbox.png"))
+            else:
+                money_bbox = ImageUtils.get_bbox(ImageUtils.load_image("mirror/shop/my_money_bbox.png"))
+            my_money = auto.get_text_from_screenshot(money_bbox)
+            parsed_money = _extract_money_from_ocr_texts(my_money)
+            if parsed_money is None:
+                scaled_money = _retry_money_ocr_with_scaled_crop(money_bbox, scale=2)
+                if scaled_money:
+                    log.debug(f"OCR 放大重试结果: {scaled_money}")
+                    parsed_money = _extract_money_from_ocr_texts(scaled_money)
+                    if parsed_money is not None:
+                        my_money = scaled_money
+            if parsed_money is not None:
+                my_remaining_money = parsed_money
+            if parsed_money is None or my_remaining_money < 0:
+                log.error("获取剩余金钱失败")
+            else:
+                log.debug(f"剩余金钱：{my_remaining_money}")
+        except Exception as e:
+            log.error(f"获取剩余金钱失败：{e}")
+        return my_remaining_money

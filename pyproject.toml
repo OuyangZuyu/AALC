@@ -1,0 +1,96 @@
+[project]
+name = "ahab-assistant-limbus-company"
+description = "Ahab Assistant for Limbus Company: automation helper (GUI, OCR, tasks)."
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "KIYI671" }]
+keywords = ["limbus", "automation", "pyqt", "ocr", "game-assistant"]
+requires-python = ">=3.12"
+version = "1.0.9"
+
+dependencies = [
+    "pyside6>=6.9.2",
+    "pyside6-fluent-widgets>=1.9.1",
+    "pyuac~=0.0.3",
+    "pywin32",
+    "PyAutoGUI",
+    "pynput",
+    "pyperclip",
+    "playsound3",
+    "requests",
+    "packaging",
+    "markdown-it-py",
+    "mdit-py-plugins",
+    "linkify-it-py",
+    "ruamel.yaml",
+    "numpy",
+    "opencv-python-headless",
+    "pillow",
+    "psutil",
+    "onnxruntime==1.20.1",
+    "concurrent-log-handler>=0.9.28",
+    "colorlog>=6.9.0",
+    "rapidocr>=3.4.1",
+    "tzdata>=2025.2",
+    "adbutils>=2.10.2",
+    "windows-toasts>=1.3.1",
+    "pydantic>=2.12.5",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.16.0",
+    "pytest>=9.1.0",
+    "ruff>=0.13.1",
+    "watchdog",
+]
+
+[project.urls]
+Homepage = "https://github.com/KIYI671/AhabAssistantLimbusCompany"
+Source = "https://github.com/KIYI671/AhabAssistantLimbusCompany"
+Issues = "https://github.com/KIYI671/AhabAssistantLimbusCompany/issues"
+
+[tool.uv]
+managed = true
+override-dependencies = ["opencv-python; python_version < '0'"]
+
+# used by `pyside6-project lupdate`
+[tool.pyside6-project]
+files = [
+    "main.py",
+    "app/__init__.py",
+    "app/my_app.py",
+    "app/page_card.py",
+    "app/setting_interface.py",
+    "app/farming_interface.py",
+    "app/tools_interface.py",
+    "app/team_setting_card.py",
+    "app/common/ui_config.py",
+    "app/starlight_bonus.py",
+    "app/base_combination.py",
+    "app/card/messagebox_custom.py",
+    "app/base_tools.py",
+    "app/language_manager.py",
+    "app/windows_toast.py",
+    "app/announcement_board.py",
+    "module/update/check_update.py",
+    "tasks/base/script_task_scheme.py",
+    "tasks/tools/production_module.py",
+    "app/theme_pack_setting_interface.py",
+    "i18n/myapp_en.ts",
+]
+
+[tool.ruff.lint]
+# 启用规则集 (E: pycodestyle, F: Pyflakes, I: isort)
+# T201: 禁止使用print进行调试
+select = ["E", "F", "I", "T201"]
+# 忽略特定的规则
+ignore = ["E501"]
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"

@@ -1,0 +1,50 @@
+# 环境
+.cursor
+.venv
+.vscode
+.agent
+.agents
+.idea
+.claude
+
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+
+
+# 构建文件
+build
+dist
+dist_release
+*.pyc
+*.pyd
+
+# 运行时生成的文件
+*.dll
+!3rdparty/PaddleOCR-json_v1.4.1/*.dll
+build.bat
+config_backup
+config.yaml*
+theme_pack_list.yaml
+/theme_pack_weight/
+logs
+pythonlogs
+i18n/*.qm
+__main_dev_temp__.py
+/*.png
+
+# 测试文件
+/test*.py
+
+# 其他
+.worktrees
+# Local runtime packages and generated test output
+/_internal/
+/*.exe
+/assets/user/
+/.pytest_cache/
+/.ruff_cache/
+*.log
+
+# Personal optional run history
+/mirror_run_log.md

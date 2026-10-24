@@ -1,0 +1,1353 @@
+import asyncio
+import ctypes
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from functools import partial
+from time import sleep
+
+import cv2
+import numpy as np
+from adbutils import AdbError, adb
+
+from module.config import cfg
+from module.logger import log
+from module.my_error.my_error import userStopError
+from utils.utils import run_as_user
+
+from .. import AbstractInput
+from ..scroll_swipe import build_scroll_swipe_plan
+from . import insert_swipe
+
+usual_key_code = {
+    "q": 16,
+    "w": 17,
+    "e": 18,
+    "r": 19,
+    "t": 20,
+    "y": 21,
+    "u": 22,
+    "i": 23,
+    "o": 24,
+    "p": 25,
+    "a": 30,
+    "s": 31,
+    "d": 32,
+    "f": 33,
+    "g": 34,
+    "h": 35,
+    "j": 36,
+    "k": 37,
+    "l": 38,
+    "z": 44,
+    "x": 45,
+    "c": 46,
+    "v": 47,
+    "b": 48,
+    "n": 49,
+    "m": 50,
+    "1": 2,
+    "2": 3,
+    "3": 4,
+    "4": 5,
+    "5": 6,
+    "6": 7,
+    "7": 8,
+    "8": 9,
+    "9": 10,
+    "0": 11,
+    "enter": 28,
+    "esc": 1,
+    "up": 103,
+    "down": 108,
+    "left": 105,
+    "right": 106,
+    "space": 57,
+    "tab": 15,
+    "shift": 42,
+    "ctrl": 29,
+    "alt": 56,
+}
+
+MUMU_TEAM_SCROLL_ESCAPE_DISTANCE_AT_1080P = 60
+MUMU_TEAM_SCROLL_ESCAPE_HOLD_DURATION = 0.1
+MUMU_TEAM_SCROLL_SETTLE_DURATION = 0.5
+MUMU_TEAM_SCROLL_SETTLE_STEP_DURATION = 0.05
+
+
+class NemuIpcIncompatible(Exception):
+    pass
+
+
+class NemuIpcError(Exception):
+    pass
+
+
+class CaptureStd:
+    """
+    Capture stdout and stderr from both python and C library
+    https://stackoverflow.com/questions/5081657/how-do-i-prevent-a-c-shared-library-to-print-on-stdout-in-python/17954769
+
+    ```
+    with CaptureStd() as capture:
+        # String wasn't printed
+        print('whatever')
+    # But captured in ``capture.stdout``
+    print(f'Got stdout: "{capture.stdout}"')
+    print(f'Got stderr: "{capture.stderr}"')
+    ```
+    """
+
+    def __init__(self):
+        self.stdout = b""
+        self.stderr = b""
+        self._capture_enabled = False
+
+    def _redirect_stdout(self, to):
+        sys.stdout.close()
+        os.dup2(to, self.fdout)
+        sys.stdout = os.fdopen(self.fdout, "w")
+
+    def _redirect_stderr(self, to):
+        sys.stderr.close()
+        os.dup2(to, self.fderr)
+        sys.stderr = os.fdopen(self.fderr, "w")
+
+    def __enter__(self):
+        try:
+            self.fdout = sys.stdout.fileno()
+            self.fderr = sys.stderr.fileno()
+        except (AttributeError, OSError, ValueError):
+            # PyInstaller GUI builds can provide no standard streams.
+            return self
+
+        self._capture_enabled = True
+        self.reader_out, self.writer_out = os.pipe()
+        self.reader_err, self.writer_err = os.pipe()
+        self.old_stdout = os.dup(self.fdout)
+        self.old_stderr = os.dup(self.fderr)
+
+        file_out = os.fdopen(self.writer_out, "w")
+        file_err = os.fdopen(self.writer_err, "w")
+        self._redirect_stdout(to=file_out.fileno())
+        self._redirect_stderr(to=file_err.fileno())
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self._capture_enabled:
+            return
+
+        self._redirect_stdout(to=self.old_stdout)
+        self._redirect_stderr(to=self.old_stderr)
+        os.close(self.old_stdout)
+        os.close(self.old_stderr)
+
+        self.stdout = self.recvall(self.reader_out)
+        self.stderr = self.recvall(self.reader_err)
+        os.close(self.reader_out)
+        os.close(self.reader_err)
+        self._capture_enabled = False
+
+    @staticmethod
+    def recvall(reader, length=1024) -> bytes:
+        fragments = []
+        while 1:
+            chunk = os.read(reader, length)
+            if chunk:
+                fragments.append(chunk)
+            else:
+                break
+        output = b"".join(fragments)
+        return output
+
+
+class CaptureNemuIpc(CaptureStd):
+    instance = None
+
+    def __init__(self, logger):
+        super().__init__()
+        self.logger = logger
+
+    def is_capturing(self):
+        """
+        Only capture at the topmost wrapper to avoid nested capturing
+        If a capture is ongoing, this instance does nothing
+        """
+        cls = self.__class__
+        return isinstance(cls.instance, cls) and cls.instance != self
+
+    def __enter__(self):
+        if self.is_capturing():
+            return self
+        super().__enter__()
+        CaptureNemuIpc.instance = self
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.is_capturing():
+            return
+
+        CaptureNemuIpc.instance = None
+        super().__exit__(exc_type, exc_val, exc_tb)
+
+        self.check_stdout()
+        self.check_stderr()
+
+    def check_stdout(self):
+        if not self.stdout:
+            return
+        self.logger.info(f"NemuIpc stdout: {self.stdout}")
+
+    def check_stderr(self):
+        if not self.stderr:
+            return
+        self.logger.error(f"NemuIpc stderr: {self.stderr}")
+
+        # Calling an old MuMu12 player
+        # Tested on 3.4.0
+        # b'nemu_capture_display rpc error: 1783\r\n'
+        # Tested on 3.7.3
+        # b'nemu_capture_display rpc error: 1745\r\n'
+        if b"error: 1783" in self.stderr or b"error: 1745" in self.stderr:
+            raise NemuIpcIncompatible("NemuIpc requires MuMu12 version >= 3.8.13, please check your version")
+        # contact_id incorrect
+        # b'nemu_capture_display cannot find rpc connection\r\n'
+        if b"cannot find rpc connection" in self.stderr:
+            raise NemuIpcError(self.stderr)
+        # Emulator died
+        # b'nemu_capture_display rpc error: 1722\r\n'
+        # MuMuVMMSVC.exe died
+        # b'nemu_capture_display rpc error: 1726\r\n'
+        # No idea how to handle yet
+        if b"error: 1722" in self.stderr or b"error: 1726" in self.stderr:
+            raise NemuIpcError("Emulator instance is probably dead")
+
+
+class MumuControl(AbstractInput):
+    connection_device = None
+    _SUPPORTED_DLL_VERSIONS = ("12.0", "15.0")
+    _NEMU_CONNECT_RETRY_THRESHOLD = 3
+
+    # 截图在途超过该时长视为卡死（正常截图远小于此值），届时弃用旧调用链并换新重试
+    _SCREENSHOT_STUCK_DEADLINE = 10.0
+
+    @staticmethod
+    def clean_connect():
+        if MumuControl.connection_device is None:
+            return
+        MumuControl.connection_device.disconnect()
+        MumuControl.connection_device.adb_disconnect()
+        MumuControl.connection_device = None
+
+    def __init__(self, instance_number=0, display_id=0):
+        self.install_path = None
+        self.nemu_folder = None
+        self.mumu_version = None
+        self.exe_path = None
+        self.multi_instance_number = instance_number
+        self.port = None
+        self.device = None
+
+        self.lib = None
+        self._ev = asyncio.new_event_loop()
+        self._ev_lock = threading.RLock()
+        self._dll_version = None
+        self._loaded_dll_version = None
+        self._nemu_connect_failures = 0
+        self._screenshot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="AALC-MuMuCapture")
+        self._screenshot_state_lock = threading.Lock()
+        self._pending_screenshot = None
+        self._screenshot_pending_since = 0.0
+        self.display_id = display_id
+
+        self.connect_id: int = 0
+        self.width = 0
+        self.height = 0
+
+        self.game_package_name = "com.ProjectMoon.LimbusCompany"
+        self.package_list = False
+
+        self.is_pause = False
+        self.restore_time = None
+
+        self.start_game_times = 0
+
+        self.mumu_control_api_backend()
+        if self.exe_path:
+            log.debug(f"MumuControl.__init__: exe_path 已初始化 -> {self.exe_path}")
+        else:
+            log.warning("MumuControl.__init__: exe_path 未初始化, 将由 start() 异常 fallback 重试")
+        self.start()
+        self.adb_connect()
+
+    def adb_connect(self, _depth=0):
+        _ADB_MAX_DEPTH = 3
+        if _depth >= _ADB_MAX_DEPTH:
+            log.error(f"ADB 连接重试次数已耗尽 ({_ADB_MAX_DEPTH}轮), 放弃连接，请检查模拟器 ADB 是否正常开启")
+            return
+        for attempt in range(3):
+            try:
+                port = self.get_mumu_adb_port()
+                log.debug(f"尝试 ADB 连接 (轮次{_depth + 1}/{_ADB_MAX_DEPTH}, 尝试{attempt + 1}/3): {port}")
+                msg = adb.connect(port)
+                if "connected" in msg:
+                    log.debug(f"成功连接至:{port},连接信息: {msg}")
+                    return
+                elif "bad port" in msg:
+                    log.error(f"ADB 连接失败，端口号{port}不正确，可能是拼写错误或不规范")
+            except Exception as e:
+                log.debug(f"ADB 连接尝试异常 (轮次{_depth + 1}, 尝试{attempt + 1}): {type(e).__name__}: {e}")
+                continue
+        log.warning(f"ADB 连接全部3次尝试失败 (轮次{_depth + 1}/{_ADB_MAX_DEPTH})，关闭模拟器并重试启动")
+        self.close_simulator()
+        self.start()
+        self.adb_connect(_depth + 1)
+
+    def adb_disconnect(self):
+        try:
+            for _ in range(3):
+                port = self.get_mumu_adb_port()
+                msg = adb.disconnect(port)
+                # Connected to 127.0.0.1:59865
+                # Already connected to 127.0.0.1:59865
+                if "disconnected" in msg:
+                    log.debug(f"成功断开连接于:{port},连接信息: {msg}")
+                    break
+                # bad port number '598265' in '127.0.0.1:598265'
+                elif "bad port" in msg:
+                    log.error(f"断开连接失败，端口号{port}不正确，可能是拼写错误或不规范")
+        except:
+            pass
+
+    def start_game(self):
+        if self.device is None:
+            self.device = adb.device(self.get_mumu_adb_port())
+        try:
+            self.device.app_start(self.game_package_name)
+        except Exception as e:
+            log.error(f"启动游戏失败，失败原因为{str(e)}")
+            log.error(
+                "启动游戏失败，请确认是否安装了Limbus Company，五秒后将重新尝试启动，每5次失败后将重启模拟器继续尝试"
+            )
+            if self.package_list is False:
+                self.package_list = True
+                command = [
+                    self.exe_path,
+                    "control",
+                    "-v",
+                    str(self.multi_instance_number),
+                    "app",
+                    "info",
+                    "-i",
+                ]
+                no_window_flag = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000
+                result = subprocess.run(
+                    command,
+                    universal_newlines=True,
+                    capture_output=True,
+                    check=True,
+                    encoding="utf-8",
+                    creationflags=no_window_flag,
+                )
+                log.debug(f"获取到的应用列表列表：{result.stdout}")
+            sleep(5)
+            if self.start_game_times > 0 and self.start_game_times % 5 == 0:
+                self.close_simulator()
+                self.start()
+            self.start_game_times += 1
+            self.start_game()
+
+    def mumu_control_api_backend(self):
+        if os.name == "nt":
+            try:
+                import winreg
+
+                # 读取注册表中的键值
+                software_name = [
+                    "MuMuPlayer-12.0",
+                    "MuMuPlayer",
+                    "MuMuPlayerGlobal-12.0",
+                    "MuMuPlayerGlobal",
+                    "YXArkNights-12.0",
+                ]
+                key = None
+                for name in software_name:
+                    try:
+                        key = winreg.OpenKey(
+                            winreg.HKEY_LOCAL_MACHINE,
+                            rf"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{name}",
+                        )
+                        if key:
+                            break
+                    except:
+                        continue
+                if not key:
+                    log.debug("mumu_control_api_backend: 未在注册表中找到任何匹配的MuMu安装项")
+                    return None
+                self.install_path = os.path.dirname(winreg.QueryValueEx(key, "DisplayIcon")[0]).strip('"')
+                mumu_version, _ = winreg.QueryValueEx(key, "DisplayVersion")
+                winreg.CloseKey(key)
+            except:
+                log.error(
+                    "读取注册表失败，无法获取MuMu安装路径，也可能是未安装MuMu模拟器，或使用了某种特供版本",
+                    exc_info=True,
+                )
+                return None
+            # 修改路径，使其指向MuMuManager.exe
+            self.exe_path = os.path.join(self.install_path, "MuMuManager.exe")
+            log.debug(
+                f"mumu_control_api_backend: 注册表命中, install_path={self.install_path}, mumu_version={mumu_version}"
+            )
+            if not os.path.isfile(self.exe_path):
+                log.debug(f"mumu_control_api_backend: exe_path 默认路径不存在 ({self.exe_path}), 尝试 shell 降级")
+                from pathlib import Path
+
+                exe_path = Path(self.exe_path)
+                parts = list(exe_path.parts)
+                if len(parts) >= 2:
+                    parts[-2] = "shell"
+                new_exe_path = Path(*parts)
+                new_exe_path_str = str(new_exe_path)
+                self.exe_path = new_exe_path_str
+                if not os.path.isfile(self.exe_path):
+                    log.error(
+                        f"查找MuMuManager.exe失败，路径{self.exe_path}不存在，请检查MuMu模拟器是否安装或是否为特供版本"
+                    )
+                    return None
+                log.debug(f"mumu_control_api_backend: shell 降级成功, exe_path={self.exe_path}")
+
+            def detect_major_version():
+                match = re.match(r"^(\d+)\.", mumu_version)
+                if match:
+                    return int(match.group(1))
+
+            self.mumu_version = detect_major_version()
+
+    def get_mumu_adb_port(self, multi_instance_number=None, _depth=0):
+        _MAX_DEPTH = 3
+        try:
+            if multi_instance_number is None and self.multi_instance_number is None:
+                self.multi_instance_number = 0
+            if int(self.multi_instance_number) <= 1536:
+                cmd = f"{self.exe_path} adb -v {self.multi_instance_number}"
+                no_window_flag = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000
+                proc = subprocess.run(
+                    cmd,
+                    universal_newlines=True,
+                    capture_output=True,
+                    encoding="utf-8",
+                    creationflags=no_window_flag,
+                )
+                adb_info = json.loads(proc.stdout)
+                try:
+                    return f"{adb_info['adb_host']}:{adb_info['adb_port']}"
+                except Exception:
+                    return f"127.0.0.1:{int(self.multi_instance_number) * 32 + 16384}"
+        except userStopError:
+            raise
+        except Exception as e:
+            if _depth >= _MAX_DEPTH:
+                log.warning(f"get_mumu_adb_port 重试耗尽 ({_MAX_DEPTH}轮)，使用默认端口计算")
+                return f"127.0.0.1:{int(self.multi_instance_number) * 32 + 16384}"
+            log.debug(
+                f"get_mumu_adb_port 异常 (轮次{_depth + 1}/{_MAX_DEPTH}): {type(e).__name__}: {e}, 触发 start() 重建后重试"
+            )
+            self.start()
+            return self.get_mumu_adb_port(multi_instance_number, _depth + 1)
+
+    def start(self):
+        try:
+            log.debug(f"开始启动MUMU模拟器实例编号{self.multi_instance_number}")
+            keptlive = self.get_app_keptlive()
+            if keptlive:
+                log.info("检测到启用了应用后台保活功能，即将关闭")
+                if self.get_launch_status() == "start_finished":
+                    log.info("检测到模拟器处于启用状态，为关闭应用后台保活，需执行重启")
+                    self.stop()
+                self.disable_app_keptlive()
+            else:
+                log.debug("未启用应用后台保活功能,可正常运行")
+            # 使用mumumanager控制模拟器开启与关闭
+            command = [
+                self.exe_path,
+                "control",
+                "-v",
+                str(self.multi_instance_number),
+                "launch",
+            ]
+            run_as_user(command)
+            # 等待模拟器启动完成
+            for _ in range(cfg.start_emulator_timeout):
+                time.sleep(1)
+                if self.get_launch_status() == "start_finished":
+                    log.debug("start: 模拟器启动状态确认为 start_finished")
+                    break
+            else:
+                log.warning(f"start: 模拟器启动等待超时 ({cfg.start_emulator_timeout}s), 状态可能仍为未启动")
+            self.port = self.get_mumu_adb_port()
+            self.load_dll()
+            log.debug(f"MUMU模拟器编号{self.multi_instance_number}启动完成")
+            self.connect()
+        except userStopError:
+            raise
+        except NemuIpcError as e:
+            self._record_nemu_connect_failure()
+            log.warning(f"start: 启动过程异常 ({type(e).__name__}: {e}), 触发 fallback 重试")
+            self.mumu_control_api_backend()
+            self.start()
+        except Exception as e:
+            self._nemu_connect_failures = 0
+            log.warning(f"start: 启动过程异常 ({type(e).__name__}: {e}), 触发 fallback 重试")
+            self.mumu_control_api_backend()
+            self.start()
+
+    def close_simulator(self):
+        command = [
+            self.exe_path,
+            "control",
+            "-v",
+            str(self.multi_instance_number),
+            "shutdown",
+        ]
+        run_as_user(command)
+
+    def stop(self):
+        try:
+            command = [
+                self.exe_path,
+                "control",
+                "-v",
+                str(self.multi_instance_number),
+                "shutdown",
+            ]
+            no_window_flag = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000
+            subprocess.run(command, creationflags=no_window_flag)
+            log.debug(f"MUMU模拟器编号{self.multi_instance_number}关闭完成")
+        except userStopError:
+            raise
+        except:
+            self.mumu_control_api_backend()
+            self.stop()
+
+    def get_path(self):
+        # 获取MuMuManager.exe所在的目录
+        return self.install_path
+
+    def get_device_path(self):
+        # 获取MuMuNxDevice.exe所在的目录
+        try:
+            if self.mumu_version == 5:
+                return os.path.join(os.path.dirname(self.install_path), "nx_device", "12.0", "shell")
+            else:
+                return self.install_path
+        except:
+            self.mumu_control_api_backend()
+            self.get_device_path()
+
+    def get_manager_path(self):
+        # 获取MuMuManager.exe所在的路径
+        return self.exe_path
+
+    def get_nemu_client_path(self,version):
+        # 获取external_renderer_ipc.dll所在的路径
+        try:
+            if self.mumu_version == 5:
+                return os.path.join(
+                    os.path.dirname(self.install_path),
+                    "nx_device",
+                    version,
+                    "shell",
+                    "sdk",
+                    "external_renderer_ipc.dll",
+                )
+            else:
+                return os.path.join(self.install_path, "sdk", "external_renderer_ipc.dll")
+        except:
+            self.mumu_control_api_backend()
+            self.get_nemu_client_path(version)
+
+    def get_android_version(self):
+        # 获取安卓版本
+        try:
+            log.debug("开始获取安卓版本")
+            if self.exe_path is None:
+                log.warning("get_android_version: exe_path 为 None, 将触发异常 fallback")
+                raise ValueError("exe_path is None")
+            command = f""" "{self.exe_path}" info -v {self.multi_instance_number}"""
+            no_window_flag = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000
+            proc = subprocess.run(
+                command,
+                shell=True,
+                text=True,  # 代替 universal_newlines=True，更现代化
+                encoding="utf-8",  # 强制指定用 utf-8 编码读取输出，解决 gbk 报错
+                errors="ignore",  # 极其重要：万一有杂音字符，忽略掉而不崩溃
+                capture_output=True,
+                check=True,  # 新增：如果命令返回非零状态码则抛出异常
+                creationflags=no_window_flag,
+            )
+
+            # 检查输出是否为空
+            if not proc.stdout.strip():
+                raise ValueError("命令返回空输出")
+
+            # 尝试解析JSON
+            try:
+                output_lines = proc.stdout.strip().splitlines()
+                clean_json = "\n".join([line for line in output_lines if "Active code page" not in line])
+                proc_result = json.loads(clean_json)
+                result = proc_result.get("android_version")  # 使用get避免KeyError
+                return result
+            except json.JSONDecodeError:
+                log.error(f"JSON解析失败！原始输出: {proc.stdout}")
+                raise  # 重新抛出异常或处理
+
+        except subprocess.CalledProcessError as cmd_err:
+            log.debug(f"命令执行失败！返回码: {cmd_err.returncode}, 错误输出: {cmd_err.stderr}")
+            # 可选：根据业务需求返回默认值或重新抛出
+            return False
+        except userStopError:
+            raise
+        except Exception as e:
+            log.error(f"获取安卓版本失败：{e}", exc_info=True)  # 记录完整堆栈
+            self.mumu_control_api_backend()
+            return self.get_android_version()
+
+    def get_app_keptlive(self):
+        # 获取应用保活状态
+        try:
+            log.debug("开始获取应用保活状态")
+            if self.exe_path is None:
+                log.warning("get_app_keptlive: exe_path 为 None, 将触发异常 fallback")
+                raise ValueError("exe_path is None")
+            command = f""" "{self.exe_path}" setting -v {self.multi_instance_number} -k app_keptlive"""
+            no_window_flag = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000
+            proc = subprocess.run(
+                command,
+                shell=True,
+                universal_newlines=True,
+                capture_output=True,
+                check=True,  # 新增：如果命令返回非零状态码则抛出异常
+                creationflags=no_window_flag,
+            )
+
+            # 检查输出是否为空
+            if not proc.stdout.strip():
+                raise ValueError("命令返回空输出")
+
+            # 尝试解析JSON
+            try:
+                output_lines = proc.stdout.strip().splitlines()
+                clean_json = "\n".join([line for line in output_lines if "Active code page" not in line])
+                proc_result = json.loads(clean_json)
+                result = bool(proc_result.get("app_keptlive") == "true")  # 使用get避免KeyError
+                return result
+            except json.JSONDecodeError:
+                log.error(f"JSON解析失败！原始输出: {proc.stdout}")
+                raise  # 重新抛出异常或处理
+
+        except subprocess.CalledProcessError as cmd_err:
+            log.debug(f"命令执行失败！返回码: {cmd_err.returncode}, 错误输出: {cmd_err.stderr}")
+            # 可选：根据业务需求返回默认值或重新抛出
+            return False
+        except userStopError:
+            raise
+        except Exception as e:
+            log.error(f"获取应用保活状态失败：{e}", exc_info=True)  # 记录完整堆栈
+            self.mumu_control_api_backend()
+            return self.get_app_keptlive()
+
+    def disable_app_keptlive(self):
+        # 关闭后台保活
+        try:
+            command = f""" "{self.exe_path}" setting -v {self.multi_instance_number} -k app_keptlive -val false"""
+            # 新增：使用shell=True执行命令
+            no_window_flag = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000
+            subprocess.run(
+                command,
+                shell=True,
+                universal_newlines=True,
+                capture_output=True,
+                creationflags=no_window_flag,
+            )
+        except:
+            self.mumu_control_api_backend()
+            self.disable_app_keptlive()
+
+    def enable_app_keptlive(self):
+        # 开启保活
+        try:
+            command = f""" "{self.exe_path}" setting -v {self.multi_instance_number} -k app_keptlive -val true"""
+            no_window_flag = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000
+            subprocess.run(
+                command,
+                universal_newlines=True,
+                capture_output=True,
+                creationflags=no_window_flag,
+            )
+        except:
+            self.mumu_control_api_backend()
+            self.enable_app_keptlive()
+
+    def get_launch_status(self):
+        # 获取启动状态
+        cmd = [self.exe_path, "info", "-v", str(self.multi_instance_number)]
+        no_window_flag = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000
+        proc = subprocess.run(
+            cmd,
+            universal_newlines=True,
+            capture_output=True,
+            encoding="utf-8",
+            creationflags=no_window_flag,
+        )
+        info = json.loads(proc.stdout)
+        try:
+            if "player_state" in info:
+                return info["player_state"]
+            if info.get("is_android_started") or info.get("is_process_started"):
+                return "start_finished"
+            return "not_launched"
+        except Exception:
+            log.warning(f"get_launch_status: 解析 info 失败，无法获取启动状态，stdout={proc.stdout}")
+            return "not_launched"
+
+    @staticmethod
+    def _alternate_dll_version(version):
+        if version == "15.0":
+            return "12.0"
+        return "15.0"
+
+    def _record_nemu_connect_failure(self):
+        self._nemu_connect_failures += 1
+        if self._nemu_connect_failures < self._NEMU_CONNECT_RETRY_THRESHOLD:
+            return
+
+        current_version = self._loaded_dll_version or self._dll_version or "12.0"
+        next_version = self._alternate_dll_version(current_version)
+        self._dll_version = next_version
+        self._nemu_connect_failures = 0
+        log.warning(
+            f"连续 {self._NEMU_CONNECT_RETRY_THRESHOLD} 次 Nemu IPC 连接失败，"
+            f"切换 DLL 版本: {current_version} -> {next_version}"
+        )
+
+    def load_dll(self, preferred_version=None):
+        nemu_folder = os.path.dirname(self.install_path)
+        version = preferred_version or self._dll_version
+        if version not in self._SUPPORTED_DLL_VERSIONS:
+            version = "15.0" if self.get_android_version() == "15.0" else "12.0"
+        self._dll_version = version
+
+        candidate_paths = []
+        seen_paths = set()
+
+        def add_candidate(path, candidate_version=None):
+            normalized_path = os.path.abspath(path)
+            if normalized_path not in seen_paths:
+                seen_paths.add(normalized_path)
+                candidate_paths.append((normalized_path, candidate_version))
+
+        # Try both versioned DLLs before the legacy unversioned paths so a fallback
+        # really tests the alternate Android version first.
+        for candidate_version in (version, self._alternate_dll_version(version)):
+            add_candidate(
+                os.path.join(nemu_folder, f"./nx_device/{candidate_version}/shell/sdk/external_renderer_ipc.dll"),
+                candidate_version,
+            )
+
+        add_candidate(os.path.join(nemu_folder, "./shell/sdk/external_renderer_ipc.dll"))
+        lib_path = self.get_nemu_client_path(version)
+        if lib_path:
+            add_candidate(lib_path)
+        nx_device_root = os.path.join(nemu_folder, "nx_device")
+        if os.path.isdir(nx_device_root):
+            for entry in sorted(os.listdir(nx_device_root)):
+                candidate = os.path.join(nx_device_root, entry, "shell", "sdk", "external_renderer_ipc.dll")
+                if entry in self._SUPPORTED_DLL_VERSIONS:
+                    add_candidate(candidate, entry)
+                else:
+                    add_candidate(candidate)
+
+        self.lib = None
+        self._loaded_dll_version = None
+        ipc_dll = ""
+        for ipc_dll, candidate_version in candidate_paths:
+            if not os.path.exists(ipc_dll):
+                continue
+            try:
+                self.lib = ctypes.CDLL(ipc_dll)
+                self._loaded_dll_version = candidate_version or version
+                break
+            except OSError as e:
+                log.error(e.__str__())
+                log.error(f"ipc_dll={ipc_dll} 存在, 但无法加载")
+                continue
+            except Exception as e:
+                log.error(e.__str__())
+                continue
+        if not self.lib:
+            log.error("NemuIpc 需要 MuMu12 版本 >= 3.8.13，请检查您的版本。")
+            log.error("以下路径均不存在")
+            for path, _ in candidate_paths:
+                log.error(f"{path}")
+            raise NemuIpcIncompatible("请在AALC设置中检查您的MuMu模拟器12版本和安装路径。")
+        else:
+            log.debug(f"ipc_dll={ipc_dll} 加载成功")
+
+    def connect(self):
+        if self.connect_id > 0:
+            return
+
+        self.nemu_folder = os.path.dirname(self.install_path)
+
+        connect_id = self.ev_run_sync(self.lib.nemu_connect, self.nemu_folder, self.multi_instance_number)
+        if connect_id == 0:
+            raise NemuIpcError("连接失败，请检查nemu_folder是否正确，模拟器是否正在运行")
+
+        self.connect_id = connect_id
+        self._nemu_connect_failures = 0
+
+        MumuControl.connection_device = self
+
+        log.debug("连接成功，已将模拟器实例记录至MumuControl.connection_device")
+
+    def disconnect(self):
+        if self.connect_id == 0:
+            return
+
+        self.ev_run_sync(self.lib.nemu_disconnect, self.connect_id)
+
+        log.debug(f"NemuIpc 断开连接: {self.connect_id}")
+        self.connect_id = 0
+
+    def reconnect(self):
+        self.disconnect()
+        self.connect()
+
+    async def ev_run_async(self, func, *args, timeout=1, **kwargs):
+        """
+        Args:
+            func: Sync function to call
+            *args:
+            timeout:
+            **kwargs:
+
+        Raises:
+            asyncio.TimeoutError: If function call timeout
+        """
+        func_wrapped = partial(func, *args, **kwargs)
+        # 原生 IPC 超时后执行器线程不会立即停止；调用方应给它足够时间完成，避免并发堆积。
+        result = await asyncio.wait_for(self._ev.run_in_executor(None, func_wrapped), timeout=timeout)
+        return result
+
+    def ev_run_sync(self, func, *args, **kwargs):
+        """
+        Args:
+            func: Sync function to call
+            *args:
+            **kwargs:
+
+        Raises:
+            asyncio.TimeoutError: If function call timeout
+            NemuIpcIncompatible:
+            NemuIpcError
+        """
+        # 输入等 NemuIpc 调用共用同一个 asyncio 事件循环，必须在最底层串行化，
+        # 避免并发 run_until_complete；截图同样经本锁与其他调用互斥。
+        with self._ev_lock:
+            result = self._ev.run_until_complete(self.ev_run_async(func, *args, **kwargs))
+
+            err = False
+            if func.__name__ == "nemu_connect":
+                if result == 0:
+                    err = True
+            else:
+                if result > 0:
+                    err = True
+            # Get to actual error message printed in std
+            if err:
+                log.warning(f"调用 {func.__name__} 失败，结果={result}")
+                with CaptureNemuIpc(log):
+                    result = self._ev.run_until_complete(self.ev_run_async(func, *args, **kwargs))
+
+            return result
+
+    def get_resolution(self):
+        """
+        Get emulator resolution, `self.width` and `self.height` will be set
+        """
+        if self.connect_id == 0:
+            self.connect()
+
+        width_ptr = ctypes.pointer(ctypes.c_int(0))
+        height_ptr = ctypes.pointer(ctypes.c_int(0))
+        nullptr = ctypes.POINTER(ctypes.c_int)()
+
+        ret = self.ev_run_sync(
+            self.lib.nemu_capture_display,
+            self.connect_id,
+            self.display_id,
+            0,
+            width_ptr,
+            height_ptr,
+            nullptr,
+        )
+        if ret > 0:
+            raise NemuIpcError("nemu_capture_display在get_resolution（）期间失败")
+        self.width = width_ptr.contents.value
+        self.height = height_ptr.contents.value
+        log.debug(f"获取到模拟器分辨率: {self.width} x {self.height}")
+        if int(cfg.set_win_size) != int(self.height):
+            if self.height in (720, 900, 1080, 1440, 1800, 2160):
+                cfg.set_value("set_win_size", self.height)
+                from module.automation import auto
+
+                auto.clear_img_cache()
+                log.debug(f"自动将AALC识别的分辨率适配模拟器设置: {self.width} x {self.height}")
+
+    def _get_screenshot_executor(self):
+        executor = getattr(self, "_screenshot_executor", None)
+        if executor is None:
+            executor = self._screenshot_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="AALC-MuMuCapture",
+            )
+        return executor
+
+    def _swap_stuck_capture_state(self):
+        """弃用疑似卡死的截图调用链：换执行器与全局IPC锁，让后续调用立即重新尝试。
+
+        卡死的旧线程会永久泄漏并持有旧锁；进程退出时 concurrent.futures 会对工作线程
+        无超时 join，若 DLL 调用持续不返回，只能杀掉 MuMu 进程使其返回。
+        """
+        self._screenshot_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="AALC-MuMuCapture",
+        )
+        self._ev_lock = threading.RLock()
+        log.warning("MuMu截图疑似卡死，已更换执行器与IPC锁，后续截图将重新尝试")
+
+    def _swap_stuck_capture_state_if_needed(self):
+        """在途截图超过卡死阈值则换血。必须先于 connect()/get_resolution() 调用，
+        否则这些 ev_run_sync 调用会堵在被卡死线程持有的旧锁上，永远到不了换血逻辑。
+        """
+        with self._screenshot_state_lock:
+            future = self._pending_screenshot
+            if (
+                future is not None
+                and time.monotonic() - self._screenshot_pending_since > self._SCREENSHOT_STUCK_DEADLINE
+            ):
+                self._swap_stuck_capture_state()
+                self._pending_screenshot = None
+
+    def _capture_display(self):
+        """在专用单线程执行器内完成一次原生截图，并与其他 NemuIpc 调用串行。"""
+        width = self.width
+        height = self.height
+        width_ptr = ctypes.pointer(ctypes.c_int(width))
+        height_ptr = ctypes.pointer(ctypes.c_int(height))
+        length = width * height * 4
+        pixels_pointer = ctypes.pointer((ctypes.c_ubyte * length)())
+
+        # wait_for 超时不会停止正在执行的 ctypes 调用；工作线程必须在调用结束前
+        # 持有全局 IPC 锁，避免截图与输入操作同时进入 MuMu DLL。
+        with self._ev_lock:
+            ret = self.lib.nemu_capture_display(
+                self.connect_id,
+                self.display_id,
+                length,
+                width_ptr,
+                height_ptr,
+                pixels_pointer,
+            )
+        if ret > 0:
+            raise NemuIpcError("nemu_capture_display failed during screenshot()")
+
+        image = np.ctypeslib.as_array(pixels_pointer.contents).reshape((height, width, 4))
+        image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+        cv2.flip(image, 0, dst=image)
+        return image
+
+    def screenshot(self, timeout=0.5):
+        """
+        Returns:
+            np.ndarray: Image array in RGB color space, already flipped upright
+        """
+        self._swap_stuck_capture_state_if_needed()
+
+        if self.connect_id == 0:
+            self.connect()
+
+        if self.height == 0:
+            self.get_resolution()
+
+        with self._screenshot_state_lock:
+            future = self._pending_screenshot
+            if future is None:
+                future = self._get_screenshot_executor().submit(self._capture_display)
+                self._pending_screenshot = future
+                self._screenshot_pending_since = time.monotonic()
+
+        timeout = max(0.0, float(timeout))
+        try:
+            image = future.result(timeout=timeout)
+        except FutureTimeoutError as exc:
+            # 不取消：运行中的 ctypes 调用无法安全终止。下一轮继续等待并复用其有效结果。
+            raise TimeoutError(f"MuMu截图超过 {timeout:.2f}s，等待同一个 IPC 调用完成") from exc
+        except Exception:
+            with self._screenshot_state_lock:
+                if self._pending_screenshot is future:
+                    self._pending_screenshot = None
+            raise
+        else:
+            with self._screenshot_state_lock:
+                if self._pending_screenshot is future:
+                    self._pending_screenshot = None
+            return image
+
+    def down(self, x, y):
+        """
+        Contact down, continuous contact down will be considered as swipe
+        """
+        if self.connect_id == 0:
+            self.connect()
+        if self.height == 0:
+            self.get_resolution()
+
+        x = int(x)
+        y = int(y)
+
+        ret = self.ev_run_sync(self.lib.nemu_input_event_touch_down, self.connect_id, self.display_id, x, y)
+        if ret > 0:
+            raise NemuIpcError("nemu_input_event_touch_down failed")
+
+    def up(self):
+        """
+        Contact up
+        """
+        if self.connect_id == 0:
+            self.connect()
+
+        ret = self.ev_run_sync(self.lib.nemu_input_event_touch_up, self.connect_id, self.display_id)
+        if ret > 0:
+            raise NemuIpcError("nemu_input_event_touch_up failed")
+
+    def key_down(self, key_code):
+        if self.connect_id == 0:
+            self.connect()
+
+        ret = self.ev_run_sync(
+            self.lib.nemu_input_event_key_down,
+            self.connect_id,
+            self.display_id,
+            key_code,
+        )
+        if ret > 0:
+            raise NemuIpcError("nemu_input_event_key_down failed")
+
+    def key_up(self, key_code):
+        if self.connect_id == 0:
+            self.connect()
+
+        ret = self.ev_run_sync(self.lib.nemu_input_event_key_up, self.connect_id, self.display_id, key_code)
+        if ret > 0:
+            raise NemuIpcError("nemu_input_event_key_up failed")
+
+    def key_press(self, key):
+        self.key_down(usual_key_code[key])
+        time.sleep(0.015)
+        self.key_up(usual_key_code[key])
+
+    def input_text(self, text: str):
+        """将提供的 `text` 直接发送到 MuMu 原生输入接口。"""
+        if not text:
+            log.warning("未提供要粘贴的文本")
+            return
+        try:
+            # 将文本编码为C字符串指针，确保与原生接口参数类型一致
+            text_bytes = text.encode("utf-8")
+            text_buffer = ctypes.c_char_p(text_bytes)
+
+            # 使用 nemu_input_text 将文本输入到模拟器，第二个参数是文本长度
+            ret = self.ev_run_sync(
+                self.lib.nemu_input_text,
+                self.connect_id,
+                len(text_bytes),
+                text_buffer,
+            )
+
+            if ret == 0:
+                log.debug(f"成功粘贴文本: {text}")
+            else:
+                log.warning(f"粘贴文本失败，返回值: {ret}")
+        except Exception as e:
+            log.error(f"粘贴操作发生异常: {e}")
+
+    def click(self, x, y):
+        msg = f"点击位置:({x},{y})"
+        log.debug(msg, stacklevel=2)
+        self.down(x, y)
+        time.sleep(0.015)
+        self.up()
+        time.sleep(0.035)
+
+    def swipe(self, x1, y1, x2, y2, duration, min_distance=10):
+        points = insert_swipe(p0=(x1, y1), p3=(x2, y2), min_distance=min_distance)
+
+        for point in points:
+            self.down(*point)
+            time.sleep(duration / min_distance)
+
+        time.sleep(0.2)
+        self.up()
+        time.sleep(0.050)
+
+    def long_click(self, x, y, duration):
+        self.down(x, y)
+        time.sleep(duration)
+        self.up()
+        time.sleep(0.050)
+
+    def set_pause(self) -> None:
+        """
+        设置暂停状态
+        """
+        self.is_pause = not self.is_pause  # 设置暂停状态
+        if self.is_pause:
+            msg = "操作将在下一次点击时暂停"
+        else:
+            msg = "继续操作"
+        log.info(msg)
+
+    def wait_pause(self) -> None:
+        """
+        当处于暂停状态时堵塞的进行等待
+        """
+        pause_identity = False
+        while self.is_pause:
+            if pause_identity is not False:
+                log.info("AALC 已暂停")
+                pause_identity = True
+            time.sleep(1)
+            self.restore_time = time.time()
+
+    def mouse_click(self, x, y, times=1, move_back=False) -> bool:
+        """在指定坐标上执行点击操作
+
+        Args:
+            x (int): x坐标
+            y (int): y坐标
+            times (int): 点击次数
+            move_back (bool): 是否在点击后将鼠标移动回原位置
+        Returns:
+            bool (True) : 总是返回True表示操作执行完毕
+        """
+        for _ in range(times):
+            self.click(x, y)
+
+        self.wait_pause()
+
+        return True
+
+    def mouse_drag_down(self, x, y, reverse=1, move_back=True) -> None:
+        """鼠标从指定位置向下拖动
+
+        Args:
+            x (int): x坐标
+            y (int): y坐标
+            reverse (int): 拖动方向，1表示向下，-1表示向上
+            move_back (bool): 是否在拖动后将鼠标移动回原位置
+        """
+        scale = cfg.set_win_size / 1080
+        x2 = x
+        y2 = y + int(300 * scale * reverse)
+        self.swipe(x1=x, y1=y, x2=x2, y2=y2, duration=0.4)
+
+    def mouse_drag(self, x, y, drag_time=0.1, dx=0, dy=0, move_back=True) -> None:
+        """鼠标从指定位置拖动到另一个位置
+        Args:
+            x (int): 起始x坐标
+            y (int): 起始y坐标
+            drag_time (float): 拖动时间
+            dx (int): x方向拖动距离
+            dy (int): y方向拖动距离
+            move_back (bool): 是否在拖动后将鼠标移动回原位置
+        """
+        self.down(x, y)
+        x2 = x + dx
+        y2 = y + dy
+        points = insert_swipe(p0=(x, y), p3=(x2, y2))
+
+        for point in points:
+            self.down(*point)
+            time.sleep(0.020)
+
+        if drag_time * 0.3 > 0.5:
+            time.sleep(drag_time * 0.3)
+        else:
+            time.sleep(0.5)
+
+        self.up()
+
+    def mouse_swipe_for_scroll(
+        self, x, y, duration=0.3, dx=0, dy=0, move_back=True
+    ) -> None:
+        """Swipe a scrollable view through MuMu's native touch injection."""
+        points = insert_swipe(
+            p0=(x, y), p3=(x + dx, y + dy), speed=8, min_distance=1
+        )
+        self.down(x, y)
+        try:
+            for point in points:
+                self.down(*point)
+                time.sleep(0.020)
+
+            time.sleep(0.200)
+        finally:
+            self.up()
+
+    def mouse_swipe_for_team_scroll(
+        self, x, y, duration=0.3, dx=0, dy=0, move_back=True
+    ) -> None:
+        """Scroll the team list without triggering team reordering or momentum."""
+        distance = (dx**2 + dy**2) ** 0.5
+        if distance == 0:
+            return
+
+        escape_distance = (
+            MUMU_TEAM_SCROLL_ESCAPE_DISTANCE_AT_1080P * cfg.set_win_size / 1080
+        )
+        unit_x = dx / distance
+        unit_y = dy / distance
+        # Upward page swipes must begin inside the visible team rows. Downward
+        # reset swipes shift their touch point instead, keeping the endpoint
+        # inside the client while preserving the same post-escape distance.
+        shift_start = dy > 0
+        touch_x = x - unit_x * escape_distance if shift_start else x
+        touch_y = y - unit_y * escape_distance if shift_start else y
+        plan = build_scroll_swipe_plan(
+            touch_x,
+            touch_y,
+            dx + unit_x * escape_distance,
+            dy + unit_y * escape_distance,
+            duration,
+            escape_distance=escape_distance,
+            escape_duration=0,
+        )
+        start = plan[0][0]
+        self.down(*start)
+        try:
+            if len(plan) > 1:
+                escape, escape_duration = plan[1]
+                time.sleep(escape_duration)
+                self.down(*escape)
+                # Give the game one render frame to recognize this as a scroll
+                # before measuring the remaining, row-accurate part of the drag.
+                time.sleep(MUMU_TEAM_SCROLL_ESCAPE_HOLD_DURATION)
+
+                end, remaining_duration = plan[-1]
+                if end != escape:
+                    move_x = end[0] - escape[0]
+                    move_y = end[1] - escape[1]
+                    point_spacing = 8 * cfg.set_win_size / 1080
+                    segment_count = max(
+                        int((move_x**2 + move_y**2) ** 0.5 / point_spacing),
+                        1,
+                    )
+                    segment_duration = remaining_duration / segment_count
+                    for step in range(1, segment_count + 1):
+                        time.sleep(segment_duration)
+                        ratio = step / segment_count
+                        self.down(
+                            escape[0] + move_x * ratio,
+                            escape[1] + move_y * ratio,
+                        )
+
+            if len(plan) > 1:
+                end = plan[-1][0]
+                settle_steps = round(
+                    MUMU_TEAM_SCROLL_SETTLE_DURATION
+                    / MUMU_TEAM_SCROLL_SETTLE_STEP_DURATION
+                )
+                # Refresh the stationary contact while holding it. MuMu's
+                # velocity tracker then sees an explicit zero-speed tail.
+                for _ in range(settle_steps):
+                    time.sleep(MUMU_TEAM_SCROLL_SETTLE_STEP_DURATION)
+                    self.down(*end)
+        finally:
+            self.up()
+
+    def mouse_scroll(self, direction: int = -3) -> bool:
+        """占位"""
+        return True
+
+    def mouse_click_blank(self, coordinate=(1, 1), times=1, move_back=False) -> bool:
+        self.mouse_click(coordinate[0], coordinate[1], times, move_back)
+        return True
+
+    def mouse_to_blank(self, coordinate=(1, 1), move_back=False) -> None:
+        """占位"""
+        return
+
+    def mouse_move(self, coordinate=(1, 1)) -> None:
+        """占位"""
+        return
+
+    def get_mouse_position(self) -> tuple[int, int]:
+        """占位"""
+        return 0, 0
+
+    def mouse_drag_link(self, position: list, drag_time=0.25, min_distance=10, move_back=False) -> None:
+        """鼠标从指定位置拖动到指定位置
+        Args:
+            x (int): 起始x坐标
+            y (int): 起始y坐标
+            position (list): 目标位置列表
+            drag_time (float): 拖动时间
+        """
+        self.down(position[0][0], position[0][1])
+        p = (position[0][0], position[0][1])
+        for pos in position[1:]:
+            points = insert_swipe(p0=(p[0], p[1]), p3=(pos[0], pos[1]), min_distance=min_distance)
+
+            for point in points:
+                self.down(*point)
+                time.sleep(drag_time / min_distance)
+
+            p = pos
+
+        time.sleep(0.5)
+        self.up()
+        time.sleep(0.050)
+
+    def check_game_alive(self) -> bool:
+        """检查游戏是否存活
+        Returns:
+            bool: True表示游戏存活，False表示游戏未启动或已退出
+        """
+        package = self.get_current_package()
+        if package != self.game_package_name:
+            return False
+        return True
+
+    def get_current_package(self):
+        for _ in range(3):
+            try:
+                current_package = self.device.app_current().package
+                log.debug(f"当前应用包名: {current_package}")
+                return current_package
+            except AdbError as e:
+                log.error(f"获取当前应用包名错误: {e}")
+                continue
+        return ""
+
+    def close_current_app(self):
+        log.info("Close Current App")
+        if self.get_current_package() is None:
+            return
+        self.device.app_stop(self.get_current_package())

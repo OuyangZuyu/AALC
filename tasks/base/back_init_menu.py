@@ -1,0 +1,123 @@
+from time import monotonic, sleep
+
+from module.automation import auto
+from module.decorator.decorator import begin_and_finish_time_log
+from module.logger import log
+from tasks.base import update_model_for_retry
+from tasks.base.retry import click_title_screen_safely, ensure_simulator_game_started, get_task_stall_timeout, retry
+from tasks.mirror.reward_card import get_reward_card
+
+LOOP_COUNT = 30
+
+@begin_and_finish_time_log(task_name="返回主界面")
+def back_init_menu(*, allow_restart: bool = True):
+    loop_count = LOOP_COUNT
+    recovery_started_at = monotonic()
+    recovery_timeout = get_task_stall_timeout()
+    auto.model = "clam"
+    while True:
+        # 次数只用于升级识别模式，重启由实际等待时间决定。
+        loop_count = max(0, loop_count - 1)
+        update_model_for_retry(loop_count, normal_at=20, aggressive_at=10)
+        if monotonic() - recovery_started_at >= recovery_timeout:
+            if not allow_restart:
+                log.warning("无法返回主界面，本次调用禁用内部重启，返回失败")
+                return False
+            from tasks.base.retry import kill_game, restart_game
+
+            log.error(f"返回主界面等待超过{recovery_timeout}秒，尝试重启游戏")
+            kill_game()
+            restart_game()
+            recovery_started_at = monotonic()
+            loop_count = LOOP_COUNT
+            auto.model = "clam"
+            sleep(1)
+            continue
+        if ensure_simulator_game_started():
+            recovery_started_at = monotonic()
+            continue
+        if retry() is False:
+            return False
+
+        if auto.click_element("home/window_assets.png") and auto.find_element("home/mail_assets.png", model="normal"):
+            return True
+
+        if auto.find_element("base/notification_close_assets.png"):
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            from tasks.base.retry import kill_game, restart_game
+            from utils.utils import get_day_of_week
+
+            kill_game()
+            if get_day_of_week() == 4:
+                seoul_tz = ZoneInfo("Asia/Seoul")
+                now_time = datetime.now(seoul_tz)
+                today_10am = now_time.replace(hour=10, minute=0, second=0, microsecond=0)
+                today_12pm = now_time.replace(hour=12, minute=0, second=0, microsecond=0)
+
+                if today_10am <= now_time <= today_12pm:
+                    time_remaining = today_12pm - now_time
+                    total_seconds = int(time_remaining.total_seconds())
+                    msg = f"当前时间为Limbus周常维护时间，距离正常维护时间结束还有{total_seconds}秒，脚本程序将暂停同样时间"
+                    log.info(msg)
+                    sleep(total_seconds)
+            if not allow_restart:
+                log.warning("检测到维护提示且本次调用禁用内部重启，返回失败")
+                return False
+            restart_game()
+            recovery_started_at = monotonic()
+            loop_count = LOOP_COUNT
+            continue
+
+        if auto.click_element("mirror/road_in_mir/towindow&forfeit_confirm_assets.png"):
+            continue
+        if auto.click_element("mirror/road_in_mir/to_window_assets.png", threshold=0.75):
+            continue
+        if auto.find_element("mirror/road_in_mir/legend_assets.png"):
+            auto.click_element("mirror/road_in_mir/setting_assets.png")
+            continue
+
+        if auto.find_element("mirror/road_in_mir/select_encounter_reward_card_assets.png"):
+            get_reward_card()
+
+        # 在剧情中
+        if auto.click_element("scenes/story_skip_confirm_assets.png"):
+            continue
+        if auto.click_element("scenes/story_skip_assets.png"):
+            continue
+        if auto.click_element("scenes/story_meun_assets.png"):
+            continue
+
+        # 等待加载情况
+        if auto.find_element("base/waiting_assets.png") or auto.find_element("base/waiting_2_assets.png"):
+            continue
+
+        # 左上角有后退键
+        if auto.click_element("home/back_assets.png"):
+            continue
+
+        # 在战斗中
+        if auto.click_element("battle/setting_assets.png"):
+            sleep(1)
+            auto.click_element("battle/give_up_assets.png", take_screenshot=True)
+            auto.click_element("battle/normal_give_up_assets.png")
+            continue
+
+        # 周年活动弹出的窗口
+        if auto.click_element("home/close_anniversary_event_assets.png"):
+            continue
+
+        # 在刚进入游戏界面时
+        if auto.find_element("base/clear_all_caches_assets.png", model="clam"):
+            if auto.click_element("base/update_confirm_assets.png"):
+                continue
+            click_title_screen_safely()
+            loop_count = LOOP_COUNT
+            continue
+
+        if auto.click_element("base/only_option_assets.png", model="clam"):
+            continue
+
+        auto.mouse_click_blank()
+        auto.key_press("esc")
