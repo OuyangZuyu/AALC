@@ -289,3 +289,39 @@ def test_configured_covers_exist() -> None:
             if not (COVER_DIR / cover).is_file()
         )
         assert missing == [], f"{name} 配置了不存在的封面：{missing}"
+
+
+def test_railway_cards_have_separate_hard_only_names_keywords_and_weights() -> None:
+    catalog = _catalog()
+    mapping = _interface_dict("THEME_PACK_HARD_NAME_MAP")
+    images = _interface_dict("THEME_PACK_HARD_IMAGE_MAP")
+    entries = (
+        ("Line 1", "1号线", "Line 1.png", 0),
+        ("Line 2", "2号线", "Line 2.png", 4),
+        ("Line 3", "3号线", "Line 3.png", 0),
+        ("Section #3", "4号线 - 第3区段", "Line 4 - Section #3.png", 0),
+        ("Section #4", "4号线 - 第4区段", "Line 4 - Section #4.png", 0),
+        ("Line 5", "5号线", "Line 5.png", 0),
+    )
+    english = _keywords("theme_pack_list", "theme_pack_list_hard")
+    chinese = _keywords("theme_pack_list_cn", "theme_pack_list_hard_cn")
+    assert "line" not in english
+    assert "号线" not in chinese
+    for key, name, cover, weight in entries:
+        assert mapping[key] == name
+        assert images[key] == cover
+        assert catalog["theme_pack_list_hard"][key] == weight
+        assert catalog["theme_pack_list_hard_cn"][name] == weight
+        assert key not in catalog["theme_pack_list"]
+        assert name not in catalog["theme_pack_list_cn"]
+        assert _match(name, chinese) == name
+        title = f"Line 4 - {key}" if key.startswith("Section") else key
+        assert _match(title, english) == key
+        assert _match(title.replace(" ", "").swapcase(), english) == key
+    assert (COVER_DIR / images["Section #3"]).read_bytes() != (COVER_DIR / images["Section #4"]).read_bytes()
+
+
+def test_railway_section_display_names_are_full_titles_not_ocr_fragments() -> None:
+    display = _interface_dict("THEME_PACK_HARD_DISPLAY_NAME_MAP")
+    assert display["Section #3"] == "Line 4 - Section #3"
+    assert display["Section #4"] == "Line 4 - Section #4"

@@ -123,7 +123,12 @@ THEME_PACK_HARD_NAME_MAP = {
     "unchanging": "无改变",
     "evil": "定义为",
     "heartb": "心意相",
-    "line": "号线",
+    "Line 1": "1号线",
+    "Line 2": "2号线",
+    "Line 3": "3号线",
+    "Section #3": "4号线 - 第3区段",
+    "Section #4": "4号线 - 第4区段",
+    "Line 5": "5号线",
     "unbound": "解放的",
     "tangling": "束缚的",
     "inert": "停滞的",
@@ -252,7 +257,12 @@ THEME_PACK_HARD_IMAGE_MAP = {
     "unchanging": "The Unchanging.png",
     "evil": "The Evil Defining.png",
     "heartb": "The Heartbreaking.png",
-    "line": "Line 1.png",
+    "Line 1": "Line 1.png",
+    "Line 2": "Line 2.png",
+    "Line 3": "Line 3.png",
+    "Section #3": "Line 4 - Section #3.png",
+    "Section #4": "Line 4 - Section #4.png",
+    "Line 5": "Line 5.png",
     "unbound": "Unbound Wrath.png",
     "tangling": "Tangling Lust.png",
     "inert": "Inert Sloth.png",
@@ -272,13 +282,12 @@ THEME_PACK_HARD_IMAGE_MAP = {
     "Blade": "Blade and Artwork.png",
     "Unsever": "The Unsevering.png",
     "Theb": "The BE.png",
-    # 以下主题包暂无对应图片文件
-    # 轨道线系列（如需支持多条线路，可添加以下映射）
-    # "line2": "Line 2.png",
-    # "line3": "Line 3.png",
-    # "line4_3": "Line 4 Section#3.png",
-    # "line4_4": "Line 4 Section#4.png",
-    # "line5": "Line 5.png",
+}
+
+# Display the full English title while retaining the user-specified OCR key.
+THEME_PACK_HARD_DISPLAY_NAME_MAP = {
+    "Section #3": "Line 4 - Section #3",
+    "Section #4": "Line 4 - Section #4",
 }
 
 # 中文主题包名称到图片文件名的映射表（普通模式）
@@ -385,7 +394,8 @@ class ThemePackCard(QFrame):
         self.name_label = TitleLabel()
         # 初始化时从配置获取语言
         # init_lang = cfg.get_value("language_in_program", "zh_cn")
-        self.name_label.setText(str(self.pack_key))
+        display_name = THEME_PACK_HARD_DISPLAY_NAME_MAP.get(self.pack_key, self.pack_key) if self.is_hard and not self.is_cn else self.pack_key
+        self.name_label.setText(str(display_name))
         self.name_label.setAlignment(Qt.AlignCenter)
         self.name_label.setWordWrap(True)
 

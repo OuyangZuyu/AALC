@@ -1124,6 +1124,16 @@ class Shop:
             if retry() is False:
                 raise self.RestartGame()
 
+    def heal_single_sinner(self, sinner_index=1):
+        """Explicit developer-flow entry; does not replace ordinary healing.
+
+        The caller must catch RestartGame and invoke recovery. It is not a
+        command that restarts the game by itself.
+        """
+        from tasks.mirror.single_sinner_heal import SingleSinnerHeal
+
+        return SingleSinnerHeal(auto, self._get_cost, self.RestartGame, log).perform(sinner_index)
+
     def enhance_gifts(self):
         _ENHANCE_SCAN_REGION_REL = {
             "left": 0.5151,
